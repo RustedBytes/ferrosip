@@ -1,0 +1,65 @@
+name: HOMER example
+
+# Runs examples/homer: ferrosip + heplify-server + homer-app + TimescaleDB,
+# then a REGISTER and a call through ferrosip, and checks HOMER stored them
+# (examples/homer/smoke.py). On changes to the example or to siptrace, weekly
+# (the HOMER images are `latest`) and by hand.
+on:
+  push:
+    branches: [main]
+    paths:
+      - examples/homer/**
+      - crates/mod-extra/src/trace.rs
+      - Dockerfile
+      - .github/workflows/homer-example.yml
+  pull_request:
+    paths:
+      - examples/homer/**
+      - crates/mod-extra/src/trace.rs
+      - Dockerfile
+      - .github/workflows/homer-example.yml
+  schedule:
+    - cron: "41 4 * * 1" # Mondays
+  workflow_dispatch:
+
+concurrency:
+  group: homer-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  homer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: examples/homer
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build the ferrosip image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: ferrosip:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Start ferrosip + HOMER
+        run: |
+          docker compose config -q
+          docker compose up -d --no-build
+          for i in $(seq 90); do
+            curl -fs -o /dev/null http://127.0.0.1:9080/ && break; sleep 2
+          done
+          docker compose ps
+      - name: Register, call, and find both in HOMER
+        run: python3 smoke.py --wait 120
+      - name: Logs
+        if: always()
+        run: docker compose logs --no-color --tail 80
+      - name: Stop
+        if: always()
+        run: docker compose down -v

@@ -1,0 +1,29 @@
+# m17-credential-store: a registrar and proxy whose subscribers' HA1s
+# live in Redis, written there by a provisioning system. They are cached
+# in a shared table, one phone per user, and an HTTP API shows a user's
+# registered phone.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m17.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+realm = "voip.example.com"
+
+[modules.redis]          # the credential store: HGET subscriber:<user> ha1
+server = ["name=creds;addr=127.0.0.1;port=${REDIS_PORT:-6379};db=0"]
+connect_timeout = "300ms"   # Redis down costs a REGISTER 300ms, not 1s
+cmd_timeout = "300ms"
+
+[modules.location]
+max_expires = "1h"
+
+[modules.http]
+listen = "127.0.0.1:${HTTP_PORT:-8080}"   # GET /phone?<user>: local only
+
+[routing]
+entry = "routes/main.fsr"

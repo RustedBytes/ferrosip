@@ -1,0 +1,24 @@
+# s11-live-reload: a relay whose routing and timers change while it runs
+# (ferroctl cfg.reload). The test edits a copy of this directory.
+#
+#   ferrosip --config examples/scenarios/s11-live-reload/ferrosip.toml
+#   ferroctl -s /tmp/ferrosip-s11.sock cfg.reload
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-s11.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+upstream = "${UPSTREAM:-sip:127.0.0.1:5080}"
+trusted = "${TRUSTED:-127.0.0.0/8}"
+release = "r1"           # stamped on relayed requests (X-Release)
+
+[modules.txn]
+fr_timer = "1s"          # reloadable: no final within this → 408
+
+[routing]
+entry = "routes/main.fsr"

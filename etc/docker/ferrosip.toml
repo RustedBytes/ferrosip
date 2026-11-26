@@ -1,0 +1,44 @@
+# ferrosip in a container: what runs. The routing is in routes/main.fsr.
+# docker-compose.yml mounts this directory at /etc/ferrosip; the image
+# carries a copy.
+#
+#   ferrosip check --config etc/docker/ferrosip.toml --explain   # every value and its source
+#   ferroctl -s /run/ferrosip/rpc.sock cfg.reload                 # after editing (in the container)
+
+[core]
+log_level = "info"
+rpc_socket = "/run/ferrosip/rpc.sock"
+# docker stop: transactions in flight get this long to finish
+# (docker-compose.yml's stop_grace_period is longer).
+shutdown_timeout = "10s"
+# workers = 4                     # UDP workers per socket (default: CPUs)
+# tcp_max_connections = 4096      # TCP/TLS/WS connections (the nofile ulimit must allow them)
+
+[[listen]]
+proto = "udp"
+addr = "0.0.0.0:5060"
+# Bridge networking: the address peers can reach, put in Via and Record-Route.
+# advertise = "${PUBLIC_IP}:5060"
+
+[[listen]]
+proto = "tcp"
+addr = "0.0.0.0:5060"
+# advertise = "${PUBLIC_IP}:5060"
+
+# TLS: also mount the certificates (docker-compose.yml).
+# [[listen]]
+# proto = "tls"
+# addr = "0.0.0.0:5061"
+# tls = "default"
+#
+# [tls.default]
+# cert = "/etc/ferrosip/tls/server.pem"
+# key = "/etc/ferrosip/tls/server.key.pem"
+
+[modules.location]                # Kamailio usrloc + registrar
+handle_lost_tcp = true            # drop bindings whose TCP/TLS/WS connection is gone
+max_contacts = 10
+max_expires = "2h"
+
+[routing]
+entry = "routes/main.fsr"

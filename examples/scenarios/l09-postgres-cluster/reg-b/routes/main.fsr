@@ -1,0 +1,59 @@
+// A registrar in a cluster on one PostgreSQL: credentials from
+// `subscriber`, contacts saved to `location` and looked up there (so
+// either registrar finds the other's registrations), numbers routed from
+// a `numbers` table.
+import auth, location, route_set, sql
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    if msg.has_to_tag {
+        guard route_set.follow() else reply(NotFound, "Not here")
+        relay(msg)
+    }
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    if !auth.check(features.realm) {
+        return refuse(msg)
+    }
+    auth.consume_credentials()
+    if msg.method == REGISTER {
+        location.save()
+    }
+    route_set.record()
+    msg.headers["X-Served-By"] = features.name
+    if msg.ruri.user =~ "^[0-9]+$" {
+        return number(msg)
+    }
+    registered_user(msg)
+}
+
+// A failed check gets a new challenge, unless the database is down: then
+// 503, so phones retry later instead of asking the user for a password.
+fn refuse(msg: Request) -> Action {
+    let up = ""
+    guard sql.query_value("db", "SELECT 1", up) else reply(ServiceUnavailable, "Database unavailable")
+    auth.challenge(features.realm)
+}
+
+// Numbers: the target from the `numbers` table (read on every call, so
+// rows added at run time count).
+fn number(msg: Request) -> Action {
+    let target = ""
+    guard sql.query_value("db", "SELECT target FROM numbers WHERE num = {sql.quote(msg.ruri.user)}", target) else reply(ServiceUnavailable, "Database unavailable")
+    guard target != "" else reply(NotFound, "No route")
+    msg.ruri = target
+    relay(msg)
+}
+
+// Users: the newest unexpired contact in the shared `location` table,
+// whichever registrar saved it (location.lookup() reads only this
+// registrar's memory).
+fn registered_user(msg: Request) -> Action {
+    let contact = ""
+    guard sql.query_value("db", "SELECT contact FROM location WHERE username = {sql.quote(msg.ruri.user)} AND expires > extract(epoch FROM now()) ORDER BY last_modified DESC, id DESC LIMIT 1", contact) else reply(ServiceUnavailable, "Database unavailable")
+    guard contact != "" else reply(NotFound, "Not registered")
+    msg.ruri = contact
+    relay(msg)
+}

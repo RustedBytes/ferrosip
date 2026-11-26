@@ -1,0 +1,23 @@
+// Multi-tenant proxy: the request's domain picks the tenant.
+import sip, route_set
+import "./tenant_a.fsr" as tenant_a
+import "./tenant_b.fsr" as tenant_b
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    if msg.has_to_tag {
+        guard route_set.follow() else reply(NotFound, "Not here")
+        relay(msg)
+    }
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    if msg.method == OPTIONS && sip.options_reply() {
+        exit
+    }
+    match msg.ruri.host {
+        "a.example.com" => tenant_a.handle(msg)
+        "b.example.com" => tenant_b.handle(msg)
+        _ => reply(NotFound, "Unknown domain")
+    }
+}

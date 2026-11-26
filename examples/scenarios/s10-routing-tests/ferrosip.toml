@@ -1,0 +1,26 @@
+# s10-routing-tests: a routing checked by its `test` blocks alone
+# (ferrosip test: real modules, a recording network, no sockets).
+#
+#   ferrosip test --config ferrosip.toml routes/main_test.fsr
+#   ferrosip test --config ferrosip.toml routes/main_test.fsr failing/expected_failure_test.fsr   # exits 1
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-s10.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+realm = "example.com"
+gw1 = "sip:10.0.0.10:5060"
+gw2 = "sip:10.0.0.11:5060"
+voicemail = "sip:vm@10.0.0.20:5060"
+trusted = "10.0.0.0/8"             # who may call PSTN numbers
+
+[modules.auth]
+users_file = "users"
+
+[routing]
+entry = "routes/main.fsr"

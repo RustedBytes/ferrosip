@@ -1,0 +1,44 @@
+// Presence server for one domain, plus a call route whose dialogs are
+// published as dialog-info.
+import presence, resource_lists, dialog, ip, route_set
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    match msg.method {
+        PUBLISH => {
+            guard msg.ruri.host == features.domain else reply(NotFound, "Not our domain")
+            presence.handle_publish()
+        }
+        SUBSCRIBE => {
+            // A refresh or unsubscribe is in the dialog: its R-URI is our
+            // Contact, not the presentity.
+            if !msg.has_to_tag {
+                guard msg.ruri.host == features.domain else reply(NotFound, "Not our domain")
+            }
+            // A list subscription is handled (and answered) by rls;
+            // anything else is a single presentity.
+            if resource_lists.handle_subscribe() {
+                exit
+            }
+            presence.handle_subscribe()
+        }
+        INVITE | ACK | BYE | CANCEL => call(msg)
+        _ => reply(MethodNotAllowed)
+    }
+}
+
+// Calls go to the one phone; dialog tracking feeds pua_dialoginfo.
+fn call(msg: Request) -> Action {
+    guard ip.in_subnet(msg.src.ip, features.trusted) else reply(Forbidden, "Not trusted")
+    if msg.has_to_tag {
+        guard route_set.follow() else reply(NotFound, "Not here")
+        relay(msg)
+    }
+    if msg.method == INVITE {
+        dialog.manage()
+        route_set.record()
+    }
+    msg.dst_uri = features.callee
+    relay(msg)
+}

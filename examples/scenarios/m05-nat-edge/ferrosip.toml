@@ -1,0 +1,24 @@
+# m05-nat-edge: a registrar for phones behind NAT. Requests and calls go
+# to the address packets really come from, not the private one the phone
+# advertises.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m05.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+realm = "example.com"
+nat_bflag = 6             # keep in step with [modules.nat] nat_bflag
+
+[modules.auth]
+users_file = "${USERS_FILE:-users}"
+
+[modules.nat]
+nat_bflag = 6             # the branch flag of contacts behind NAT (stored with the registration)
+
+[routing]
+entry = "routes/main.fsr"

@@ -1,0 +1,14 @@
+# Heap allocations per request that each scenario may not exceed (DHAT,
+# bench/allocs.sh --check, default N1/N2; CI runs it). Each budget is the
+# measured value plus 0.3: runs vary by about ±0.1 (hash-table growth,
+# timer slots), while one more allocation on the hot path adds 1.0. When
+# an extra allocation is worth it, raise the number here in the same
+# change and say why in the commit.
+#
+# scenario  max allocations / request   (measured)
+sl          1.3                          # 1.0
+udp         22.1                         # 21.8
+tcp         21.1                         # 20.8
+reg         19.6                         # 19.3
+inv         25.2                         # 24.9
+fsr         22.1                         # 21.8-21.9, as udp: the same routing in .fsr

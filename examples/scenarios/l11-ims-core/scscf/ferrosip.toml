@@ -1,0 +1,47 @@
+# l11-ims-core / scscf: registrar (MAR → 401 → SAR) and the session's
+# service node, in both the originating and the terminating leg; serves
+# reg-event subscriptions. Registrations are kept in a database.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-l11-scscf.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SCSCF_PORT:-5080}"
+
+[feature]
+realm = "ims.test"
+icscf = "${ICSCF:-sip:127.0.0.1:5070}"   # originating calls go on to the I-CSCF (LIR for the callee)
+
+[modules.txn]
+fr_timer = "6s"
+
+[modules.diameter]
+identity = "scscf.ims.test"
+realm = "ims.test"
+# Cx over TLS (RFC 6733 §13): the HSS's certificate must name hss.ims.test
+# and be signed by tls_ca_list; ours is its client certificate.
+peer = ["fqdn=hss.ims.test;realm=ims.test;host=${HSS_HOST:-127.0.0.1};port=${HSS_PORT:-5658};proto=tls"]
+tls_certificate = "${TLS_DIR:-../../../../etc/tls}/server.pem"
+tls_private_key = "${TLS_DIR:-../../../../etc/tls}/server.key.pem"
+tls_ca_list = "${TLS_DIR:-../../../../etc/tls}/ca.pem"
+tc = "1s"
+transaction_timeout = "2s"
+
+[modules.ims_auth]
+name = "sip:scscf.ims.test:${SCSCF_PORT:-5080}"
+registration_default_algorithm = "MD5"   # SIP Digest unless the HSS says AKA
+
+[modules.ims_usrloc_scscf]
+# Registrations and reg-event subscriptions are written through to the
+# database and loaded at startup: they survive a restart.
+db_mode = "write-through"
+db_url = "sqlite://${STATE_DIR:-/var/lib/ferrosip}/scscf.db"
+
+[modules.ims_registrar_scscf]
+name = "sip:scscf.ims.test:${SCSCF_PORT:-5080}"
+default_expires = 600
+
+[routing]
+entry = "routes/main.fsr"

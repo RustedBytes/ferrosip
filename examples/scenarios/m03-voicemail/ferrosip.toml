@@ -1,0 +1,25 @@
+# m03-voicemail: calls to registered users; busy, no answer or not
+# registered → the voicemail server.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m03.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+realm = "example.com"
+voicemail = "${VOICEMAIL:-sip:127.0.0.1:5090}"   # where voicemail calls go
+voicemail_domain = "voicemail.example.com"     # R-URI host of a voicemail call: sip:<mailbox>@voicemail.example.com
+trusted = "${TRUSTED:-127.0.0.0/8}"            # who may place calls (the PBX network)
+
+[modules.auth]
+users_file = "${USERS_FILE:-users}"
+
+[modules.txn]
+fr_inv_timer = "60s"     # the ring time is the await's timeout (5s), not this
+
+[routing]
+entry = "routes/main.fsr"

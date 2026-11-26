@@ -1,0 +1,28 @@
+# m04-pstn-trunk: users dial numbers in any usual form; the proxy
+# normalises them to E.164, picks a trunk by prefix, sends emergency calls
+# to the emergency gateway, and asserts the caller's identity (RFC 3325).
+# Calls from the trunks (by source address) go to the PBX.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m04.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+realm = "example.com"
+country_code = "49"                                 # national 0… → +49…
+trunk_de = "${TRUNK_DE:-sip:127.0.0.2:5060}"        # +49: the domestic carrier, in our trust domain
+trunk_intl = "${TRUNK_INTL:-sip:127.0.0.3:5060}"    # everything else: not trusted with identities
+emergency = "${EMERGENCY:-sip:127.0.0.1:5090}"      # 110 / 112: the emergency gateway
+pbx = "${PBX:-sip:127.0.0.1:5070}"                  # calls from the trunks
+trunk_ips = "${TRUNK_IPS:-127.0.0.2/32,127.0.0.3/32}"  # who may send calls without credentials
+trusted_ips = "${TRUSTED_IPS:-127.0.0.2/32}"        # whose P-Asserted-Identity we believe
+
+[modules.auth]
+users_file = "${USERS_FILE:-users}"
+
+[routing]
+entry = "routes/main.fsr"

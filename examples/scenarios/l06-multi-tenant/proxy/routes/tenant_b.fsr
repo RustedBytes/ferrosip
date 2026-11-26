@@ -1,0 +1,21 @@
+// Tenant B (b.example.com): one call at a time, no PSTN.
+import auth, location, route_set, dialog
+
+fn handle(msg: Request) -> Action {
+    guard msg.from.host == "b.example.com" else reply(Forbidden, "Wrong tenant")
+    guard auth.check("b.example.com") else auth.challenge("b.example.com")
+    auth.consume_credentials()
+    if msg.method == REGISTER {
+        location.save()
+    }
+    guard msg.method == INVITE else reply(MethodNotAllowed)
+    guard !(msg.ruri.user =~ "^\\+[0-9]+$") else reply(Forbidden, "No PSTN for this tenant")
+    let active = 0
+    dialog.profile_value_size("calls", "b", active)
+    guard active < 1 else reply(BusyHere, "Tenant B call limit")
+    route_set.record()
+    dialog.manage()
+    dialog.set_profile_value("calls", "b")
+    guard location.lookup() else reply(NotFound, "Not registered")
+    relay(msg)
+}

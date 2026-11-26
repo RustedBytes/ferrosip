@@ -1,0 +1,51 @@
+# ferrosip in a container (image: Dockerfile, Alpine + static musl binary).
+#
+#   docker compose up -d --build
+#   docker compose logs -f ferrosip
+#   docker compose exec ferrosip ferroctl -s /run/ferrosip/rpc.sock stats.get_statistics all
+#   docker compose exec ferrosip ferroctl -s /run/ferrosip/rpc.sock cfg.reload   # after editing the config
+#
+# Configuration: etc/docker/ferrosip.toml (listeners, core settings, module
+# parameters) and etc/docker/routes/main.fsr (the routing), mounted at
+# /etc/ferrosip. cfg.reload re-reads the routing and the reloadable TOML
+# parameters; listeners and other startup settings need a restart.
+#
+# Networking: SIP carries addresses inside its messages (Via, Contact,
+# Record-Route), so the proxy uses the host's network stack and sees real
+# addresses; no NAT, no port ranges. That's Linux only. For a bridge
+# network (Docker Desktop, or isolation), see the commented block at the end.
+
+services:
+  ferrosip:
+    build: .
+    image: ferrosip:latest
+    network_mode: host
+    restart: unless-stopped
+    # tini as PID 1: reaps processes started by the script (exec module).
+    init: true
+    command: ["--config", "/etc/ferrosip/ferrosip.toml"]
+    volumes:
+      # ferrosip.toml + routes/: edit them on the host, then
+      # `ferroctl cfg.reload` (or restart).
+      - ./etc/docker:/etc/ferrosip:ro
+      # TLS: the certificates, and the [[listen]] tls / [tls.default] lines
+      # in ferrosip.toml.
+      # - ./certs:/etc/ferrosip/tls:ro
+    # Longer than core.shutdown_timeout: transactions in flight get to finish.
+    stop_grace_period: 15s
+    ulimits:
+      # One descriptor per TCP/TLS/WS connection (core.tcp_max_connections, default 4096).
+      nofile:
+        soft: 65536
+        hard: 65536
+    # The image's HEALTHCHECK (ferroctl core.uptime over the RPC socket) applies.
+
+# Bridge networking instead: replace `network_mode: host` with the lines
+# below and set `advertise` on the listeners in etc/docker/ferrosip.toml to
+# your host's public IP, so Via and Record-Route carry an address peers can
+# reach.
+#
+#    ports:
+#      - "5060:5060/udp"
+#      - "5060:5060/tcp"
+#      - "5061:5061/tcp"

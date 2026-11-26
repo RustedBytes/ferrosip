@@ -1,0 +1,19 @@
+// One routing for every environment: [feature] values from the overlay
+// decide what runs (a false feature's branch is compiled out).
+import auth, ip, text
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    guard ip.in_subnet(msg.src.ip, features.trusted) else reply(Forbidden, "Not trusted")
+    if features.require_auth {
+        guard auth.check(features.realm, "subscriber", 1) else auth.challenge(features.realm, 1)
+        auth.consume_credentials()
+    }
+    if features.debug_headers {
+        text.append_header("X-Debug: from {msg.src.ip}:{msg.src.port} to {features.upstream}\r\n")
+    }
+    text.append_header("X-Env: {features.env_name}\r\n")
+    msg.dst_uri = features.upstream
+    relay(msg)
+}

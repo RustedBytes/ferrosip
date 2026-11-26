@@ -1,0 +1,44 @@
+// P-CSCF: REGISTERs go to the I-CSCF with our Path; the 200 tells us the
+// UE's Service-Route and identities. Requests from a registered UE get a
+// P-Asserted-Identity and the Service-Route; requests from the S-CSCF
+// follow the Path back to the UE.
+import ims_registrar_pcscf, path, route_set
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    if msg.has_to_tag {
+        guard route_set.follow() else reply(NotFound, "Not here")
+        relay(msg)
+    }
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    if msg.method == REGISTER {
+        ims_registrar_pcscf.save_pending()
+        path.add()
+        msg.dst_uri = features.icscf
+        relay(msg)
+    }
+    // Terminating: the S-CSCF sends it along the Path we gave (a Route to
+    // us, then the UE's contact as R-URI). Only the S-CSCF may do that.
+    if "{msg.src.ip}:{msg.src.port}" == features.scscf_addr {
+        guard route_set.follow() else reply(Forbidden, "No Path")
+        route_set.record()
+        relay(msg)
+    }
+    // Originating: only from a registered UE, as one of its identities.
+    guard ims_registrar_pcscf.is_registered() else reply(Forbidden, "Not registered")
+    guard ims_registrar_pcscf.assert_identity(msg.from.uri) else reply(Forbidden, "Identity not registered")
+    msg.headers.remove("P-Preferred-Identity")
+    msg.headers["P-Asserted-Identity"] = "<{msg.from.uri}>"
+    route_set.record()
+    ims_registrar_pcscf.force_service_routes()
+    relay(msg)
+}
+
+// The S-CSCF's 200 to a REGISTER: store the expiry, Service-Route and
+// P-Associated-URI (contacts with expires 0 are removed).
+on reply(r: Reply) where r.method == REGISTER && r.code == OK {
+    ims_registrar_pcscf.save()
+}

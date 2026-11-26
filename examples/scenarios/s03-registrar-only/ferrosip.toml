@@ -1,0 +1,25 @@
+# s03-registrar-only: a registrar and nothing else. Expiry limits,
+# max_contacts, `*` unregistration and Path.
+#
+#   ferrosip --config examples/scenarios/s03-registrar-only/ferrosip.toml
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-s03.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+trusted = "${TRUSTED:-127.0.0.0/8}"
+
+[modules.location]       # usrloc + registrar
+default_expires = "10m"  # a REGISTER that asks for nothing
+min_expires = "30s"      # shorter: 423 Interval Too Brief
+max_expires = "1h"       # longer: capped
+max_contacts = 3         # more bindings per AoR: 503
+use_path = true          # store and echo Path (path_mode lazy: when the UA sent Supported: path)
+
+[routing]
+entry = "routes/main.fsr"

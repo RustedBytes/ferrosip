@@ -1,0 +1,15 @@
+// Trunk ingress: only the carriers' addresses may send; their requests go
+// to the PBX.
+import acl
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    // The carriers' IPs, from ferrosip.toml.
+    guard msg.src.ip in [features.trunk_a, features.trunk_b] else reply(Forbidden, "Not a trunk IP")
+    // The exact trunk addresses (ip:port), group 1 of the address table:
+    // changed at run time with permissions.addressReload.
+    guard acl.source_allowed(1) else reply(Forbidden, "Not a trunk")
+    msg.dst_uri = features.pbx
+    relay(msg)
+}

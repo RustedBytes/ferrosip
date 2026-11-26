@@ -1,0 +1,26 @@
+# m11-rate-limits: a per-source request limit (pipelimit, one pipe per
+# ip:port) and a global cap on new calls (ratelimit); both answer 503 with
+# Retry-After. Established calls are never limited.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m11.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+upstream = "${UPSTREAM:-sip:127.0.0.1:5080}"
+trusted = "${TRUSTED:-127.0.0.0/8}"
+
+[modules.pipe_limits]    # pipelimit: per source, created on first use
+timer_interval = "2s"    # a pipe's limit is per 2s window
+
+[modules.limits]         # ratelimit: the static pipe for INVITEs
+pipe = ["calls:TAILDROP:4"]
+queue = ["calls:INVITE"]
+timer_interval = "2s"
+
+[routing]
+entry = "routes/main.fsr"

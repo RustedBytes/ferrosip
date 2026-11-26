@@ -1,0 +1,14 @@
+// Calls to numbers: the gateways in turn, the next when one fails.
+// Imported by main.fsr as `pstn`: its functions are pstn.<name>.
+
+fn send(msg: Request) -> Action {
+    for gw in ["sip:10.0.0.10:5060", "sip:10.0.0.11:5060"] {
+        msg.dst_uri = gw
+        let res = await txn.relay(msg, timeout: 10s)
+        match res {
+            Final(r) if r.code < 500 => forward(r)
+            _ => {}
+        }
+    }
+    reply(ServiceUnavailable, "No Gateway")
+}

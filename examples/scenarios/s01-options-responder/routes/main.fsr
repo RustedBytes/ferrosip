@@ -1,0 +1,16 @@
+// Keepalive responder in front of one upstream.
+import sip, ip
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    // Malformed requests get sanity's own error reply, then nothing more.
+    guard sip.check() else exit
+    // OPTIONS to the proxy itself (no user part): answer 200 here.
+    if msg.method == OPTIONS && sip.options_reply() {
+        exit
+    }
+    guard ip.in_subnet(msg.src.ip, features.trusted) else reply(Forbidden, "Not trusted")
+    msg.dst_uri = features.upstream
+    relay(msg)
+}

@@ -1,0 +1,28 @@
+// Tenant A (a.example.com): two calls at a time, numbers go to its PSTN
+// gateway.
+import auth, location, route_set, dialog
+import { features } from config
+
+fn handle(msg: Request) -> Action {
+    // Users of A only: a From in another tenant is refused before the
+    // challenge, so it can't be used to probe A's users.
+    guard msg.from.host == "a.example.com" else reply(Forbidden, "Wrong tenant")
+    guard auth.check("a.example.com") else auth.challenge("a.example.com")
+    auth.consume_credentials()
+    if msg.method == REGISTER {
+        location.save()
+    }
+    guard msg.method == INVITE else reply(MethodNotAllowed)
+    let active = 0
+    dialog.profile_value_size("calls", "a", active)
+    guard active < 2 else reply(BusyHere, "Tenant A call limit")
+    route_set.record()
+    dialog.manage()
+    dialog.set_profile_value("calls", "a")
+    if msg.ruri.user =~ "^\\+[0-9]\{6,15\}$" {
+        msg.dst_uri = features.gw_a
+        relay(msg)
+    }
+    guard location.lookup() else reply(NotFound, "Not registered")
+    relay(msg)
+}

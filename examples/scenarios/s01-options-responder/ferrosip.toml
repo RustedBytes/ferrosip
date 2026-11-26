@@ -1,0 +1,19 @@
+# s01-options-responder: answer keepalives, guard Max-Forwards and malformed
+# requests, relay the rest to one upstream for trusted sources.
+#
+#   ferrosip --config examples/scenarios/s01-options-responder/ferrosip.toml
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-s01.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+upstream = "${UPSTREAM:-sip:127.0.0.1:5080}"
+trusted = "${TRUSTED:-127.0.0.0/8}"
+
+[routing]
+entry = "routes/main.fsr"

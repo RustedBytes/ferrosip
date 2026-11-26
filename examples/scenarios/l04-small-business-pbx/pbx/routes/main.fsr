@@ -1,0 +1,87 @@
+// A small office PBX: registrar, auth, voicemail, forwarding, BLF, CDRs.
+import auth, location, route_set, dialog, presence
+import { features } from config
+
+// Unconditional forwarding: extension → extension (set over HTTP).
+shared table forward: Map<Str, Str>
+
+dialog var caller: Str
+dialog var callee: Str
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    if msg.has_to_tag {
+        guard route_set.follow() else reply(NotFound, "Not here")
+        relay(msg)
+    }
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    // dialog-info PUBLISHes from our own presence client (pua_dialoginfo).
+    if msg.method == PUBLISH && msg.src.ip == "127.0.0.1" && "{msg.src.port}" == features.self_port {
+        presence.handle_publish()
+    }
+    guard auth.check(features.domain) else auth.challenge(features.domain)
+    auth.consume_credentials()
+    match msg.method {
+        REGISTER => location.save()
+        SUBSCRIBE => presence.handle_subscribe()
+        INVITE => call(msg)
+        _ => reply(MethodNotAllowed)
+    }
+}
+
+fn call(msg: Request) -> Action {
+    let ext = msg.ruri.user
+    guard ext =~ "^1[0-9][0-9]$" else reply(NotFound, "No such extension")
+    // One hop only: a forward to an extension that forwards too isn't
+    // followed (no loops).
+    if forward.contains(ext) {
+        msg.headers["Diversion"] = "<sip:{ext}@{features.domain}>;reason=unconditional"
+        ext = forward.get(ext)
+        msg.ruri.user = ext
+    }
+    route_set.record()
+    dialog.manage()
+    dialog.caller = msg.from.user
+    dialog.callee = ext
+    guard location.lookup() else voicemail(msg, ext)
+    let res = await txn.relay(msg, timeout: 4s)
+    match res {
+        Final(r) if r.code == BusyHere || r.code == TemporarilyUnavailable || r.code == RequestTimeout => voicemail(msg, ext)
+        Timeout => voicemail(msg, ext)
+        Final(r) => forward(r)
+    }
+}
+
+fn voicemail(msg: Request, ext: Str) -> Action {
+    msg.ruri = "sip:{ext}@{features.domain}"
+    msg.dst_uri = features.voicemail
+    relay(msg)
+}
+
+on dialog.ended(d: Dialog) {
+    log.info("CDR call_id={d.call_id} caller={d.caller} callee={d.callee} duration={d.duration} reason={d.end_reason}\n")
+}
+
+on dialog.failed(d: Dialog) {
+    log.info("CDR call_id={d.call_id} caller={d.caller} callee={d.callee} failed={d.code}\n")
+}
+
+// GET / POST (body: the target extension) / DELETE /forward?<extension>
+on http(req: HttpRequest) where req.path == "/forward" {
+    guard req.query =~ "^1[0-9][0-9]$" else req.reply(400, "not an extension\n")
+    if req.method == "DELETE" {
+        forward.remove(req.query)
+        req.reply(204)
+    }
+    if req.method == "POST" {
+        guard req.body =~ "^1[0-9][0-9]$" else req.reply(400, "the target must be an extension\n")
+        forward.set(req.query, req.body)
+        req.reply(200, "{req.query} → {req.body}\n")
+    }
+    if forward.contains(req.query) {
+        req.reply(200, forward.get(req.query))
+    }
+    req.reply(404, "no forwarding\n")
+}

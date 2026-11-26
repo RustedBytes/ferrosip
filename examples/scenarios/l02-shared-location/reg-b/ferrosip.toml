@@ -1,0 +1,25 @@
+# l02-shared-location / reg-b: one of two registrars sharing one SQLite
+# location table (usrloc write-through).
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-l02-b.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5070}"
+
+[feature]
+realm = "example.com"
+name = "reg-b"           # added to relayed requests as X-Served-By
+
+[modules.auth]
+users_file = "${USERS_FILE:-../users}"
+
+[modules.location]
+db_mode = "write-through"    # every change is written to the table at once
+db_url = "${LOCATION_DB:-sqlite:///tmp/ferrosip-l02-location.db}"
+max_expires = "1h"
+
+[routing]
+entry = "routes/main.fsr"

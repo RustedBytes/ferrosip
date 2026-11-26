@@ -1,0 +1,51 @@
+// S-CSCF: registrar (MAR → 401, then SAR → 200 with Service-Route), then
+// the two legs of a session: originating (the request came along the
+// Service-Route <sip:orig@us;lr>) on to the I-CSCF, terminating (from the
+// I-CSCF) to the callee's contacts through their P-CSCF (the Path). Also
+// the notifier of reg-event subscriptions.
+import ims_auth, ims_registrar_scscf, route_set
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    if msg.has_to_tag {
+        guard route_set.follow() else reply(NotFound, "Not here")
+        relay(msg)
+    }
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    if msg.method == REGISTER {
+        guard ims_auth.www_authenticate(features.realm) else ims_auth.www_challenge(features.realm)
+        ims_registrar_scscf.save()
+    }
+    // A reg-event subscription (RFC 3680), e.g. the UE's to its own
+    // registration, sent along its Service-Route: answered here, then
+    // NOTIFYs on every change. Only for identities of the same implicit
+    // set (P-Asserted-Identity from the P-CSCF, else From).
+    if msg.method == SUBSCRIBE {
+        guard msg.headers["Event"] == "reg" else reply(BadEvent)
+        guard ims_registrar_scscf.can_subscribe() else reply(Forbidden, "Not allowed to watch this registration")
+        ims_registrar_scscf.subscribe()
+    }
+    if msg.headers["Route"] =~ "sip:orig@" {
+        originating(msg)
+    }
+    terminating(msg)
+}
+
+fn originating(msg: Request) -> Action {
+    guard route_set.follow() else reply(Forbidden, "Bad Route")
+    guard ims_registrar_scscf.orig_registered() else reply(Forbidden, "Originating user not registered")
+    // ;orig marks our Record-Route: in-dialog requests are in this leg.
+    route_set.record("orig")
+    msg.dst_uri = features.icscf
+    relay(msg)
+}
+
+fn terminating(msg: Request) -> Action {
+    guard ims_registrar_scscf.term_registered() else reply(TemporarilyUnavailable, "Not registered")
+    route_set.record()
+    guard ims_registrar_scscf.lookup() else reply(TemporarilyUnavailable, "No contact")
+    relay(msg)
+}

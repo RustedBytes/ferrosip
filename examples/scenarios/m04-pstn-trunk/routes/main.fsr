@@ -1,0 +1,83 @@
+// PSTN access: normalise the dialled number to E.164, route by prefix,
+// emergency calls first, identity per RFC 3325.
+import auth, ip, route_set, sip, text
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    if msg.has_to_tag {
+        guard route_set.follow() else reply(NotFound, "Not here")
+        relay(msg)
+    }
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    if msg.method == OPTIONS && sip.options_reply() {
+        exit
+    }
+    guard msg.method == INVITE else reply(MethodNotAllowed)
+    // Nobody asserts an identity to us but a trusted trunk.
+    if !ip.in_subnet(msg.src.ip, features.trusted_ips) {
+        msg.headers.remove("P-Asserted-Identity")
+    }
+    msg.headers.remove("P-Preferred-Identity")
+    route_set.record()
+    if ip.in_subnet(msg.src.ip, features.trunk_ips) {
+        // From the PSTN: to the PBX.
+        msg.dst_uri = features.pbx
+        relay(msg)
+    }
+    // Emergency calls go through even without credentials.
+    if msg.ruri.user == "110" || msg.ruri.user == "112" {
+        msg.dst_uri = features.emergency
+        relay(msg)
+    }
+    guard auth.check(features.realm) else auth.challenge(features.realm)
+    auth.consume_credentials()
+    normalise(msg)
+    to_trunk(msg)
+}
+
+// The dialled number in E.164 (+49…), or a short code as dialled; anything
+// else is left as it is and fails the check above.
+fn normalise(msg: Request) {
+    // Visual separators: 030-1234 567, (030) 1234.
+    text.subst_user("/[-. ()]//g")
+    let n = msg.ruri.user
+    if n =~ "^00[1-9]" {
+        text.subst_user("/^00/+/")
+    } else if n =~ "^0[1-9]" {
+        text.subst_user("/^0/+{features.country_code}/")
+    }
+}
+
+fn to_trunk(msg: Request) -> Action {
+    let n = msg.ruri.user
+    if text.starts_with(n, "+") {
+        // E.164, and long enough to be a subscriber (+49 30 1234…).
+        guard sip.is_e164(n) && n =~ "^[+][0-9]\{7,\}$" else reply(AddressIncomplete)
+        if text.starts_with(n, "+{features.country_code}") {
+            return via_trunk(msg, features.trunk_de, true)
+        }
+        return via_trunk(msg, features.trunk_intl, false)
+    }
+    // Short codes (only domestic): match the number by value.
+    guard n =~ "^1[0-9]\{2,5\}$" else reply(AddressIncomplete)
+    let code = pv("$(rU\{s.int\})")
+    match code {
+        116000..116999 => via_trunk(msg, features.trunk_de, true)
+        115 | 118 => via_trunk(msg, features.trunk_de, true)
+        _ => reply(AddressIncomplete)
+    }
+}
+
+// Assert the caller (authenticated: the From user is the credentials'
+// user) unless they asked for privacy and the trunk is not trusted.
+fn via_trunk(msg: Request, trunk: Str, trusted: Bool) -> Action {
+    let hidden = text.search_header("Privacy", "(^|[ ;])id([ ;]|$)")
+    if trusted || !hidden {
+        msg.headers["P-Asserted-Identity"] = "<sip:{msg.from.user}@{features.realm}>"
+    }
+    msg.dst_uri = trunk
+    relay(msg)
+}

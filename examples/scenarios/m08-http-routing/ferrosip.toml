@@ -1,0 +1,21 @@
+# m08-http-routing: an HTTP routing service picks the target of every
+# call; when it can't answer (error, too slow, down) calls take a fallback.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m08.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+routing = "${ROUTING_URL:-http://127.0.0.1:8090}"   # the routing service
+fallback = "${FALLBACK:-sip:127.0.0.1:5090}"        # where calls go when it can't say
+trusted = "${TRUSTED:-127.0.0.0/8}"
+
+[modules.http_async_client]
+workers = 4              # queries in parallel; SIP workers never wait on them
+
+[routing]
+entry = "routes/main.fsr"

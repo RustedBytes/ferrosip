@@ -1,0 +1,31 @@
+// A registrar and proxy on four transports. Calls go to where the callee
+// registered from (its connection, for TCP, TLS and WS), or to the R-URI
+// itself (with its ;transport=) when the callee isn't registered.
+import ip, location, route_set
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    if msg.has_to_tag {
+        if route_set.follow() {
+            relay(msg)
+        }
+        if msg.method == ACK {
+            drop
+        }
+        reply(NotFound, "Not here")
+    }
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    guard ip.in_subnet(msg.src.ip, features.trusted) else reply(Forbidden, "Not trusted")
+    if msg.method == REGISTER {
+        location.save()
+    }
+    // Twice (r2=on) when the request leaves on another transport.
+    route_set.record()
+    // A registered callee: its contact, over the connection it registered
+    // on. Anyone else: the R-URI as it is (host, port and ;transport=).
+    location.lookup()
+    relay(msg)
+}

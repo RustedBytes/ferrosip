@@ -1,0 +1,37 @@
+// Routing by an HTTP service, with a fallback for every way it can fail.
+import http, ip, route_set
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    guard ip.in_subnet(msg.src.ip, features.trusted) else reply(Forbidden, "Not trusted")
+    if msg.has_to_tag {
+        guard route_set.follow() else reply(NotFound, "Not here")
+        relay(msg)
+    }
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    if msg.method != INVITE {
+        reply(MethodNotAllowed)
+    }
+    // The number goes into the URL path: only digits and letters (and a
+    // leading +), so a user part can't add path segments or parameters.
+    guard msg.ruri.user =~ "^\\+?[0-9A-Za-z]+$" else reply(AddressIncomplete, "Bad number")
+    route_set.record()
+    let r = await http.get("{features.routing}/route/{msg.ruri.user}?caller={msg.from.user}", """X-Call-ID: {msg.call_id}
+X-Caller: {msg.from.uri}""", timeout: 1s)
+    // The service answers "ip:port".
+    if r.ok && r.status == 200 && r.body =~ "^[0-9.]+:[0-9]+$" {
+        msg.dst_uri = "sip:{r.body}"
+        relay(msg)
+    }
+    let why = "error {r.error}"
+    if r.ok {
+        why = "status {r.status}"
+    }
+    log.warn("routing service: {why} after {r.ms}ms, {msg.call_id} goes to the fallback\n")
+    msg.headers["X-Routing-Fallback"] = why
+    msg.dst_uri = features.fallback
+    relay(msg)
+}

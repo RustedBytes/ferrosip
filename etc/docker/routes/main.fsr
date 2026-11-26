@@ -1,0 +1,23 @@
+// A registrar and proxy: phones register, calls go to the registered
+// contacts of the callee. It is open: anyone may register as anyone, and
+// calls to registered users come from anywhere (the two lint allows below).
+// For digest authentication see examples/scenarios/m01-registrar-proxy.
+import location
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+
+    // Keep-alive pings are answered at once.
+    if msg.method == OPTIONS {
+        reply(OK)
+    }
+
+    if msg.method == REGISTER {
+        location.save()  // lint: allow(register_without_auth)
+    }
+
+    // To the callee's registered contacts, over the connection they
+    // registered from (NAT-safe; reuses their TCP/TLS/WebSocket connection).
+    guard location.lookup() else reply(NotFound)
+    relay(msg)  // lint: allow(open_relay)
+}

@@ -1,0 +1,36 @@
+# s09-transports: one proxy on UDP, TCP, TLS and WebSocket. Phones register
+# over any of them and are called over the transport they registered
+# with; the proxy Record-Routes twice when it changes transport.
+#
+#   etc/tls/gen-certs.sh     # once, for the TLS certificate
+#   ferrosip --config examples/scenarios/s09-transports/ferrosip.toml
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-s09.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[[listen]]
+proto = "tcp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[[listen]]
+proto = "tls"
+addr = "127.0.0.1:${TLS_PORT:-5061}"
+
+[[listen]]
+proto = "ws"
+addr = "127.0.0.1:${WS_PORT:-8088}"
+
+[tls.default]
+cert = "${TLS_DIR:-../../../etc/tls}/server.pem"
+key = "${TLS_DIR:-../../../etc/tls}/server.key.pem"
+
+[feature]
+trusted = "${TRUSTED:-127.0.0.0/8}"
+
+[routing]
+entry = "routes/main.fsr"

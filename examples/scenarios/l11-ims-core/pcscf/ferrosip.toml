@@ -1,0 +1,24 @@
+# l11-ims-core / pcscf: the UE's first hop. Keeps the UE's registration
+# (learned from the 200 to its REGISTER), asserts its identity and sends
+# its requests along the Service-Route. No Diameter here (no Rx/PCRF).
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-l11-pcscf.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${PCSCF_PORT:-5060}"
+
+[feature]
+icscf = "${ICSCF:-sip:127.0.0.1:5070}"          # where REGISTERs go
+scscf_addr = "${SCSCF_ADDR:-127.0.0.1:5080}"    # the only source of terminating requests
+
+[modules.txn]
+fr_timer = "8s"          # the I-CSCF may wait up to 2s for the HSS, twice per REGISTER
+
+# ims_usrloc_pcscf and ims_registrar_pcscf take no parameters: they load
+# because the routing calls their functions.
+
+[routing]
+entry = "routes/main.fsr"

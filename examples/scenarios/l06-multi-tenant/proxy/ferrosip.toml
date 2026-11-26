@@ -1,0 +1,29 @@
+# l06-multi-tenant / proxy: one proxy for two tenants, told apart by the
+# request's domain. Users, limits and routes per tenant come from
+# routes/tenant_a.fsr and routes/tenant_b.fsr.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-l06.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+gw_a = "${GW_A:-sip:127.0.0.1:5081}"   # tenant A's PSTN gateway
+
+[modules.auth]
+db_url = "${SUBSCRIBER_DB:-sqlite:///var/lib/ferrosip/tenants.db}"
+calculate_ha1 = true      # the subscriber table holds plain passwords
+use_domain = true         # alice@a and alice@b are different users
+
+[modules.location]
+use_domain = true         # …and different registrations
+max_expires = "1h"
+
+[modules.dialog]
+profiles_with_value = "calls"   # active calls per tenant
+
+[routing]
+entry = "routes/main.fsr"

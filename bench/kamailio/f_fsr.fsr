@@ -1,0 +1,5 @@
+// Benchmark: the routing of f_udp.cfg written in .fsr (bench/ab.sh fsr).
+// Relay everything to the UAS on 5070 over UDP.
+route main(msg: Request) {
+    txn.relay(msg, to: "udp:127.0.0.1:5070")
+}

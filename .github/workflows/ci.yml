@@ -1,0 +1,396 @@
+name: CI
+
+# Runs what a change can affect (job `changes`):
+# - docs-only changes run nothing;
+# - Rust code runs the build, e2e and fuzz jobs;
+# - dependencies run the supply-chain and docker jobs;
+# - sip_core::limit runs loom;
+# - edits to this workflow run everything.
+# The nightly schedule and manual runs always run every job, with the long
+# soak and fuzz times. `ci-ok` sums up, for branch protection.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *" # nightly: everything, long soak + long fuzz
+  workflow_dispatch:
+
+# A newer push to a PR replaces its running CI. Runs on main are never
+# cancelled: each merge gets its result.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  changes:
+    name: what changed
+    runs-on: ubuntu-24.04
+    outputs:
+      # Nightly / manual: everything.
+      all: ${{ steps.f.outputs.ci == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+      rust: ${{ steps.f.outputs.rust }}
+      e2e: ${{ steps.f.outputs.e2e }}
+      deps: ${{ steps.f.outputs.deps }}
+      docker: ${{ steps.f.outputs.docker }}
+      loom: ${{ steps.f.outputs.loom }}
+      fuzz: ${{ steps.f.outputs.fuzz }}
+      webui: ${{ steps.f.outputs.webui }}
+      shell: ${{ steps.f.outputs.shell }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: f
+        with:
+          filters: |
+            ci:
+              - .github/workflows/ci.yml
+            rust: &rust
+              - "**/*.rs"
+              - "**/Cargo.toml"
+              - Cargo.lock
+              - rust-toolchain.toml
+              - rustfmt.toml
+              - etc/**
+              - tests/compat/**
+            e2e:
+              - *rust
+              - tests/**
+            deps:
+              - "**/Cargo.toml"
+              - Cargo.lock
+              - fuzz/Cargo.lock
+              - deny.toml
+            docker:
+              - Dockerfile
+              - docker-compose.yml
+              - .dockerignore
+              - "**/Cargo.toml"
+              - Cargo.lock
+              - etc/ferrosip.cfg
+            loom:
+              - crates/sip-core/src/limit.rs
+              - crates/sip-core/Cargo.toml
+            webui:
+              - crates/mod-webui/**
+              - crates/mod-ai/**   # the browser test shows AI calls
+              - tests/webui_browser.mjs
+              - tests/e2e_webui.py
+            shell:
+              - "**/*.sh"
+              - "**/*.py"
+              - ruff.toml
+            fuzz:
+              - fuzz/**
+              - crates/sip-parser/**
+              - crates/sip-core/**
+              - crates/sip-script/**
+              - crates/sip-transport/**
+              - crates/sip-diameter/**
+              - crates/mod-media/**
+              - crates/mod-ims/**
+              - Cargo.lock
+
+  shellcheck:
+    name: lint scripts (shellcheck, ruff)
+    needs: changes
+    if: needs.changes.outputs.all == 'true' || needs.changes.outputs.shell == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # shellcheck is preinstalled on the runner image.
+      - name: Every shell script lints clean
+        run: |
+          shellcheck --version | head -2
+          git ls-files -z '*.sh' | xargs -0 shellcheck
+      - name: Every Python script lints clean (ruff.toml)
+        run: pipx run ruff==0.16.9 check --output-format github .
+
+  allocs:
+    name: allocations per request (DHAT budget)
+    needs: changes
+    if: needs.changes.outputs.all == 'true' || needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.100
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends valgrind
+      - run: cargo build --release -p ferrosip -p sipflood
+      # Exact counts: fails when a hot path gains an allocation
+      # (bench/allocs-budget.txt says how to raise a budget on purpose).
+      - run: bench/allocs.sh --check
+
+  check:
+    name: build, clippy, unit tests
+    needs: changes
+    if: needs.changes.outputs.all == 'true' || needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.100
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      # The MySQL / PostgreSQL drivers are off by default: CI builds and
+      # tests them (db-all) everywhere a database is involved.
+      - run: cargo build --release --workspace --all-targets --features ferrosip/db-all
+      - run: cargo clippy --release --workspace --all-targets -- -D warnings
+      - run: cargo clippy --release --workspace --all-targets --features ferrosip/db-all -- -D warnings
+      - name: Lean feature combinations compile cleanly
+        run: |
+          cargo clippy --release -p ferrosip --no-default-features -- -D warnings
+          cargo clippy --release -p ferrosip --no-default-features --features db-sqlite,http -- -D warnings
+          for f in sqlite mysql postgres; do
+            cargo clippy --release -p sip-db --all-targets --no-default-features --features $f -- -D warnings
+          done
+      # Test certificates (gitignored) for the TLS unit tests.
+      - run: etc/tls/gen-certs.sh
+      - run: cargo test --release --workspace --features ferrosip/db-all
+      - name: Script formatting
+        run: target/release/ferroctl fmt --check etc/ferrosip.cfg
+      - name: Kamailio configs (ferrosip -c)
+        run: tests/compat/check.sh
+
+  supply-chain:
+    name: cargo-deny, cargo-audit
+    needs: changes
+    if: needs.changes.outputs.all == 'true' || needs.changes.outputs.deps == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.100
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-audit
+      # Licenses, banned crates (no C TLS stack), sources, advisories: deny.toml.
+      - run: cargo deny check
+      # RustSec: fails on vulnerabilities; unmaintained notices are printed.
+      # The nightly schedule picks up advisories published after a merge.
+      - run: cargo audit
+
+  docker:
+    name: docker image (Alpine, musl)
+    needs: changes
+    if: needs.changes.outputs.all == 'true' || needs.changes.outputs.docker == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: ferrosip:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Compose file is valid
+        run: docker compose config -q
+      - name: Smoke test (OPTIONS over UDP and TCP, healthcheck, graceful stop)
+        run: |
+          docker image ls ferrosip:ci
+          # The image's own command: --config /etc/ferrosip/ferrosip.toml.
+          docker run -d --name fs --network host ferrosip:ci
+          python3 - <<'PY'
+          import socket, time
+          m = ("OPTIONS sip:127.0.0.1:5060 SIP/2.0\r\nVia: SIP/2.0/{t} 127.0.0.1:5999;branch=z9hG4bK{t};rport\r\n"
+               "From: <sip:a@x>;tag=1\r\nTo: <sip:b@x>\r\nCall-ID: {t}\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 70\r\n"
+               "Content-Length: 0\r\n\r\n")
+          for _ in range(50):
+              try:
+                  c = socket.create_connection(("127.0.0.1", 5060), timeout=2); break
+              except OSError:
+                  time.sleep(0.2)
+          c.sendall(m.format(t="TCP").encode())
+          assert c.recv(4096).startswith(b"SIP/2.0 200"), "TCP"
+          u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("127.0.0.1", 5999)); u.settimeout(2)
+          u.sendto(m.format(t="UDP").encode(), ("127.0.0.1", 5060))
+          assert u.recv(4096).startswith(b"SIP/2.0 200"), "UDP"
+          print("OPTIONS answered over UDP and TCP")
+          PY
+          docker exec fs ferroctl -s /run/ferrosip/rpc.sock core.version
+          for i in $(seq 30); do
+            s=$(docker inspect -f '{{.State.Health.Status}}' fs); [ "$s" = healthy ] && break; sleep 2
+          done
+          echo "health: $s"; [ "$s" = healthy ]
+          docker stop -t 15 fs
+          [ "$(docker inspect -f '{{.State.ExitCode}}' fs)" = 0 ]
+          docker logs fs 2>&1 | tail -3
+
+  loom:
+    name: loom models (sip_core::limit)
+    needs: changes
+    if: needs.changes.outputs.all == 'true' || needs.changes.outputs.loom == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.100
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loom
+      - name: Exhaustive interleavings of the connection-limit primitives
+        run: cargo test --release -p sip-core loom
+        env:
+          RUSTFLAGS: --cfg loom
+
+  e2e:
+    name: e2e suites, SIPp interop, soak
+    needs: changes
+    if: needs.changes.outputs.all == 'true' || needs.changes.outputs.e2e == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.100
+      - uses: Swatinem/rust-cache@v2
+      - name: Install PostgreSQL, MariaDB, SIPp, iproute2
+        run: |
+          # The runner image ships MySQL; MariaDB's packages replace it.
+          sudo systemctl stop mysql 2>/dev/null || true
+          sudo apt-get purge -y 'mysql-*' 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql mariadb-server redis-server sip-tester iproute2
+          # The suite starts its own servers on private ports.
+          sudo systemctl stop postgresql mariadb redis-server 2>/dev/null || true
+      - run: etc/tls/gen-certs.sh
+      - run: cargo build --release --workspace --features ferrosip/db-all
+      # rtpflux, pinned to a commit: move the pin to take a newer version.
+      - name: Check out rtpflux (the media relay e2e_rtpflux runs behind the rtpengine module)
+        uses: actions/checkout@v7
+        with:
+          repository: RustedBytes/rtpflux
+          ref: a2726888600683dfe4357c48a9c5c8aa56018a7f
+          path: rtpflux
+      - name: Build rtpflux
+        run: |
+          git -C rtpflux log -1 --format='rtpflux %h %s'
+          cargo build --release --manifest-path rtpflux/Cargo.toml -p rtpflux
+          echo "RTPFLUX=$PWD/rtpflux/target/release/rtpflux" >> "$GITHUB_ENV"
+      - name: e2e suites
+        # Root: e2e_sqldb runs the database servers as postgres/root and
+        # e2e_ims installs kernel IPsec SAs (ip xfrm needs CAP_NET_ADMIN).
+        # tests/run_e2e.py: one suite at a time, a log per suite, a summary.
+        run: sudo -E python3 tests/run_e2e.py --timeout 600
+      - name: SIPp interop
+        run: python3 tests/interop_sipp.py
+      - name: Soak (short)
+        if: github.event_name != 'schedule'
+        run: python3 tests/soak.py 90
+      - name: Soak (nightly, 15 min)
+        if: github.event_name == 'schedule'
+        run: python3 tests/soak.py 900
+
+  fuzz:
+    name: fuzz smoke
+    needs: changes
+    if: needs.changes.outputs.all == 'true' || needs.changes.outputs.fuzz == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: Fuzz every target (60 s each; 30 min nightly)
+        run: fuzz/run.sh ${{ github.event_name == 'schedule' && 1800 || 60 }}
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts
+          path: |
+            fuzz/artifacts/
+            fuzz/logs/
+
+  webui:
+    name: web UI (bundle up to date, browser smoke)
+    needs: changes
+    if: needs.changes.outputs.all == 'true' || needs.changes.outputs.webui == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/mod-webui/ui/package-lock.json
+      - name: Type-check and build the bundle; it must match the committed one
+        working-directory: crates/mod-webui/ui
+        run: |
+          npm ci
+          npm run typecheck
+          npm run build
+          git diff --exit-code -- ../assets || { echo "::error::crates/mod-webui/assets is stale: run 'npm run build' in crates/mod-webui/ui and commit"; exit 1; }
+      - uses: dtolnay/rust-toolchain@1.100
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p ferrosip
+      - name: Browser smoke test (Playwright, Chromium)
+        run: |
+          npm install --no-save --prefix "$RUNNER_TEMP/pw" playwright@1.63.0
+          "$RUNNER_TEMP/pw/node_modules/.bin/playwright" install --with-deps chromium
+          NODE_PATH="$RUNNER_TEMP/pw/node_modules" node tests/webui_browser.mjs
+      - name: Screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: webui-screenshots
+          path: target/webui-shots/
+
+  # Diameter over SCTP: this job loads the kernel's sctp module, so the
+  # SCTP tests that skip elsewhere (no SCTP in the kernel) must pass here.
+  sctp:
+    name: Diameter over SCTP
+    needs: changes
+    if: needs.changes.outputs.all == 'true' || needs.changes.outputs.e2e == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      REQUIRE_SCTP: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.100
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sctp
+      - name: Load the sctp kernel module
+        run: |
+          sudo modprobe sctp || { sudo apt-get update && sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)" && sudo modprobe sctp; }
+          python3 -c "import socket; socket.socket(socket.AF_INET, socket.SOCK_STREAM, 132).close(); print('SCTP available')"
+      - run: etc/tls/gen-certs.sh
+      - name: sip-diameter SCTP unit test
+        run: cargo test --release -p sip-diameter sctp -- --nocapture
+      - run: cargo build --release -p ferrosip -p ferroctl
+      - name: e2e_diameter (SCTP acceptor included)
+        run: python3 tests/e2e_diameter.py
+
+  # One check for branch protection: fails if any job failed or was
+  # cancelled; jobs skipped because nothing relevant changed are fine.
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [changes, shellcheck, allocs, check, supply-chain, docker, loom, e2e, sctp, fuzz, webui]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: All required jobs passed or were skipped
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for r in $RESULTS; do
+            case "$r" in success|skipped) ;; *) echo "::error::a job ended with: $r"; exit 1;; esac
+          done

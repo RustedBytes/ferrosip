@@ -1,0 +1,9 @@
+// Deliberately broken: a mock of a function that doesn't exist. ferrosip
+// test must refuse the file (with a did-you-mean) and run nothing.
+//   ferrosip test --config ferrosip.toml failing/does_not_compile_test.fsr
+
+test "mocks a misspelt function" {
+    location.lokup = true
+    send("INVITE sip:bob@example.com")
+    assert(reply_code() == OK)
+}

@@ -1,0 +1,102 @@
+// Call center: a hunt group over the agents registered to `sales`, with
+// a supervisor API: transfer a customer (REFER), call a customer back.
+import auth, location, route_set, dialog
+import { features } from config
+
+// The tags of each answered call, by Call-ID: the transfer API finds the
+// dialog with them.
+shared table call_ftag: Map<Str, Str> ttl 2h
+shared table call_ttag: Map<Str, Str> ttl 2h
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    if msg.has_to_tag {
+        // In-dialog requests are matched to their call by the cookie (did)
+        // in our Record-Route (dlg_match_mode 0): one for a call we don't
+        // track, or with a forged cookie, goes no further.
+        guard msg.method == ACK || dialog.is_known() else reply(CallDoesNotExist, "Call Does Not Exist")
+        guard route_set.follow() else reply(NotFound, "Not here")
+        relay(msg)
+    }
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    // A callback (POST /callback): dialog.bridge's INVITE to the hunt
+    // group comes from the ACD itself.
+    if msg.method == INVITE && msg.src.ip == "127.0.0.1" && "{msg.src.port}" == features.self_port {
+        guard msg.ruri.user == "sales" else reply(Forbidden, "Callbacks ring the hunt group")
+        route_set.record()
+        dialog.manage()
+        hunt(msg)
+    }
+    guard auth.check(features.realm) else auth.challenge(features.realm)
+    auth.consume_credentials()
+    if msg.method == REGISTER {
+        location.save()
+    }
+    guard msg.method == INVITE else reply(MethodNotAllowed)
+    guard msg.ruri.user == "sales" else reply(NotFound, "No such queue")
+    route_set.record()
+    dialog.manage()
+    hunt(msg)
+}
+
+// Agents by q, highest first: one q-group at a time, each rung for up to
+// 3s (agents with the same q ring together); then voicemail.
+fn hunt(msg: Request) -> Action {
+    guard location.lookup() else voicemail(msg)
+    guard txn.load_contacts() else voicemail(msg)
+    txn.next_contacts()
+    while true {
+        let res = await txn.relay(msg, timeout: 3s)
+        match res {
+            Final(r) if r.code < 300 => forward(r)
+            _ => {}
+        }
+        // The caller hung up mid-hunt: stop. Say 487 ourselves: left to
+        // itself, the transaction would send the best reply of all the
+        // branches, which may be an earlier agent's 486.
+        guard !txn.is_canceled() else reply(RequestTerminated)
+        // Busy, declined or no answer: the next q-group.
+        if !txn.next_contacts() {
+            break
+        }
+    }
+    voicemail(msg)
+}
+
+fn voicemail(msg: Request) -> Action {
+    msg.ruri = "sip:sales@{features.realm}"
+    msg.dst_uri = features.voicemail
+    relay(msg)
+}
+
+on dialog.started(d: Dialog) {
+    call_ftag.set(d.call_id, d.from_tag)
+    call_ttag.set(d.call_id, d.to_tag)
+}
+
+on dialog.ended(d: Dialog) {
+    call_ftag.remove(d.call_id)
+    call_ttag.remove(d.call_id)
+}
+
+// POST /transfer?<call-id>, body: a user. The customer (the caller) of
+// that answered call gets a REFER to sip:<user>@realm inside the call, as
+// if from the agent; the call itself ends with the customer's BYE.
+on http(req: HttpRequest) where req.path == "/transfer" && req.method == "POST" {
+    guard req.body =~ "^[a-z0-9]+$" else req.reply(400, "the target must be a user name\n")
+    guard call_ftag.contains(req.query) else req.reply(404, "no such call\n")
+    guard dialog.get(req.query, call_ftag.get(req.query), call_ttag.get(req.query)) else req.reply(404, "no such call\n")
+    guard dialog.refer("caller", "sip:{req.body}@{features.realm}") else req.reply(500, "REFER not sent\n")
+    req.reply(202, "transferring\n")
+}
+
+// POST /callback, body: the customer's user name. The ACD calls the hunt
+// group (through itself, so the hunt applies) and REFERs the agent who
+// answers to the customer, then hangs up its own leg.
+on http(req: HttpRequest) where req.path == "/callback" && req.method == "POST" {
+    guard req.body =~ "^[a-z0-9]+$" else req.reply(400, "the customer must be a user name\n")
+    guard dialog.bridge("sip:sales@{features.realm}", "sip:{req.body}@{features.realm}", features.self_uri) else req.reply(500, "callback not started\n")
+    req.reply(202, "calling back\n")
+}

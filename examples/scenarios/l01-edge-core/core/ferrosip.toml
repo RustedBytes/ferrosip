@@ -1,0 +1,22 @@
+# l01-edge-core / core: registrar and authentication behind the edge.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-l01-core.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${CORE_PORT:-5070}"
+
+[feature]
+realm = "example.com"
+
+[modules.auth]
+users_file = "${USERS_FILE:-users}"
+
+[modules.location]
+max_expires = "1h"
+use_path = true          # store the edge's Path: calls go back through it (default false, as in Kamailio)
+
+[routing]
+entry = "routes/main.fsr"

@@ -1,0 +1,39 @@
+# l07-call-center / acd: agents log in by registering to the hunt group's
+# AoR (sales) with a q-value; calls hunt through them by q, one q-group at
+# a time, and overflow to voicemail. Calls are tracked dialogs: the
+# supervisor transfers a customer over HTTP (REFER), and a callback
+# request rings the hunt group and REFERs the agent who answers to the
+# customer.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-l07.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+realm = "cc.example.com"
+voicemail = "${VOICEMAIL:-sip:127.0.0.1:5090}"
+self_port = "${SIP_PORT:-5060}"           # callback INVITEs come from ourselves
+self_uri = "sip:127.0.0.1:${SIP_PORT:-5060}"
+
+[modules.auth]
+users_file = "${USERS_FILE:-users}"
+
+[modules.location]
+max_expires = "1h"
+
+[modules.txn]
+fork_by_q = true          # load_contacts / next_contacts: one q-group per step
+
+[modules.dialog]
+dlg_match_mode = 0        # in-dialog requests are matched by the Record-Route cookie (did) only
+bridge_controller = "sip:acd@cc.example.com"   # From of callback INVITEs, Referred-By of transfers
+
+[modules.http]
+listen = "127.0.0.1:${HTTP_PORT:-8080}"   # the supervisor API: local only
+
+[routing]
+entry = "routes/main.fsr"

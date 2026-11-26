@@ -1,0 +1,24 @@
+[package]
+name = "mod-async"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+sip-parser.workspace = true
+sip-core.workspace = true
+mod-txn.workspace = true
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+serde_json.workspace = true
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+
+[features]
+default = ["http"]
+# http_client and http_async_client (ureq with rustls).
+http = ["dep:ureq"]
+
+[lints]
+workspace = true

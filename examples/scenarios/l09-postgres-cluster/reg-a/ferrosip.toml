@@ -1,0 +1,33 @@
+# l09-postgres-cluster / reg-a: one of two registrars on one PostgreSQL:
+# credentials from `subscriber`, contacts in `location`, number routes in
+# a `numbers` table.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-l09-a.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+realm = "example.com"
+name = "reg-a"           # added to relayed requests as X-Served-By
+
+[modules.auth]           # auth + auth_db: a connection per check, so rows added at run time count
+db_url = "${DB_URL:-postgres://ferrosip@127.0.0.1:5432/ferrosip}"
+calculate_ha1 = true     # the password column holds plain text
+
+[modules.location]
+db_mode = "write-through"    # "db-only" is the same in ferrosip: lookups read memory
+db_url = "${DB_URL:-postgres://ferrosip@127.0.0.1:5432/ferrosip}"
+max_expires = "1h"
+
+[modules.sql]            # sqlops: the shared lookups
+sqlcon = ["db=>${DB_URL:-postgres://ferrosip@127.0.0.1:5432/ferrosip}"]
+
+[modules.txn]
+fr_timer = "2s"
+
+[routing]
+entry = "routes/main.fsr"

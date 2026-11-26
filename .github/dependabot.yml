@@ -1,0 +1,39 @@
+# Weekly dependency updates. Minor and patch bumps come as one grouped PR
+# per ecosystem; major bumps get their own PRs. CI (build, clippy, tests,
+# e2e, cargo-deny, cargo-audit) runs on each.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor:
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    ignore:
+      # Its ref is the Rust version to install (pinned to rust-toolchain.toml's
+      # 1.100), not the action's version: Dependabot "bumps" it to Rust
+      # releases that don't exist yet. Change the toolchain by hand, in both.
+      - dependency-name: dtolnay/rust-toolchain
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    ignore:
+      # The Rust version follows rust-toolchain.toml; change both by hand.
+      - dependency-name: rust
+  - package-ecosystem: npm
+    directory: "/crates/mod-webui/ui"
+    schedule:
+      interval: weekly
+    groups:
+      webui:
+        patterns: ["*"]

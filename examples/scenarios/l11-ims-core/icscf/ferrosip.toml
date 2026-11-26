@@ -1,0 +1,33 @@
+# l11-ims-core / icscf: the network's entry point. Asks the HSS (Cx UAR for
+# REGISTER, LIR for the rest) which S-CSCF serves a user and forwards there.
+# It stays out of the dialogs (no Record-Route).
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-l11-icscf.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${ICSCF_PORT:-5070}"
+
+[modules.txn]
+fr_timer = "6s"
+
+[modules.diameter]
+identity = "icscf.ims.test"
+realm = "ims.test"
+# Cx over TLS (RFC 6733 §13): the HSS's certificate must name hss.ims.test
+# and be signed by tls_ca_list; ours is its client certificate.
+peer = ["fqdn=hss.ims.test;realm=ims.test;host=${HSS_HOST:-127.0.0.1};port=${HSS_PORT:-5658};proto=tls"]
+tls_certificate = "${TLS_DIR:-../../../../etc/tls}/server.pem"
+tls_private_key = "${TLS_DIR:-../../../../etc/tls}/server.key.pem"
+tls_ca_list = "${TLS_DIR:-../../../../etc/tls}/ca.pem"
+tc = "1s"                    # reconnect fast after the HSS restarts
+transaction_timeout = "2s"   # a silent HSS costs 2s, not the default 5s
+
+[modules.ims_icscf]
+# Used only when the HSS answers with capabilities instead of a Server-Name.
+scscf_entry = ["${SCSCF:-sip:127.0.0.1:5080};caps=1,2"]
+
+[routing]
+entry = "routes/main.fsr"

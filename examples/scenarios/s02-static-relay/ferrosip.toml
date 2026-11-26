@@ -1,0 +1,23 @@
+# s02-static-relay: every request from a trusted source goes to one
+# upstream; a silent upstream gets 408 after fr_timer.
+#
+#   ferrosip --config examples/scenarios/s02-static-relay/ferrosip.toml
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-s02.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+upstream = "${UPSTREAM:-sip:127.0.0.1:5080}"
+trusted = "${TRUSTED:-127.0.0.0/8}"
+
+[modules.txn]
+fr_timer = "1s"          # no final (nor a provisional) within 1s: 408
+fr_inv_timer = "3s"      # an INVITE that rang: 408 (and CANCEL upstream) after 3s
+
+[routing]
+entry = "routes/main.fsr"

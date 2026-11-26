@@ -1,0 +1,15 @@
+// A registrar only: REGISTERs from the trusted network are saved, the
+// rest is refused.
+import ip, location, text
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    guard ip.in_subnet(msg.src.ip, features.trusted) else reply(Forbidden, "Not trusted")
+    if msg.method != REGISTER {
+        // RFC 3261 §21.4.6: a 405 lists what is allowed.
+        text.append_to_reply("Allow: REGISTER\r\n")
+        reply(MethodNotAllowed)
+    }
+    location.save()
+}

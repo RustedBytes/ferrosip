@@ -1,0 +1,62 @@
+// A small PBX front: authenticated registrations, calls to registered
+// users with voicemail on busy or no answer, numbers to two gateways.
+import auth, location, ip, route_set
+import { features } from config
+
+shared table calls: Map<Str, Counter> ttl 1h
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    if msg.has_to_tag {
+        guard route_set.follow() else reply(NotFound, "Not here")
+        relay(msg)
+    }
+    match msg.method {
+        OPTIONS => reply(OK)
+        REGISTER => register(msg)
+        INVITE => invite(msg)
+        CANCEL => relay(msg)
+        _ => reply(MethodNotAllowed)
+    }
+}
+
+fn register(msg: Request) -> Action {
+    guard auth.check(features.realm, "subscriber", 1) else auth.challenge(features.realm, 1)
+    auth.consume_credentials()
+    location.save()
+}
+
+fn invite(msg: Request) -> Action {
+    guard auth.check(features.realm, "subscriber", 1) else auth.challenge(features.realm, 1)
+    auth.consume_credentials()
+    calls.incr(msg.from.user)
+    route_set.record()
+    if msg.ruri.user =~ "^\\+?[0-9]\{6,\}$" {
+        guard ip.in_subnet(msg.src.ip, features.trusted) else reply(Forbidden, "No PSTN from here")
+        return pstn(msg)
+    }
+    guard location.lookup() else reply(NotFound, "Not registered")
+    let res = await txn.relay(msg, timeout: 20s)
+    match res {
+        Final(r) if r.code == BusyHere => voicemail(msg)
+        Timeout => voicemail(msg)
+        Final(r) => forward(r)
+    }
+}
+
+fn voicemail(msg: Request) -> Action {
+    msg.ruri = features.voicemail
+    relay(msg)
+}
+
+fn pstn(msg: Request) -> Action {
+    for gw in [features.gw1, features.gw2] {
+        msg.dst_uri = gw
+        let res = await txn.relay(msg, timeout: 2s)
+        match res {
+            Final(r) if r.code < 500 || r.code >= 600 => forward(r)
+            _ => {}
+        }
+    }
+    reply(ServiceUnavailable, "No gateway")
+}

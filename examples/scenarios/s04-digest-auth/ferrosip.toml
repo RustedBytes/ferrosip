@@ -1,0 +1,25 @@
+# s04-digest-auth: digest authentication from a users file. REGISTERs are
+# challenged with 401 and saved, other requests with 407 and relayed to
+# the upstream.
+#
+#   ferrosip --config examples/scenarios/s04-digest-auth/ferrosip.toml
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-s04.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+realm = "example.com"
+upstream = "${UPSTREAM:-sip:127.0.0.1:5080}"
+
+[modules.auth]
+users_file = "users"                         # alice: plain, bob: sha256 HA1, carol: md5 HA1
+algorithm = "${AUTH_ALG:-SHA-256,MD5}"       # one challenge per algorithm, preferred first
+nonce_expire = "${NONCE_EXPIRE:-60s}"        # the test runs with 2s to see stale nonces
+
+[routing]
+entry = "routes/main.fsr"

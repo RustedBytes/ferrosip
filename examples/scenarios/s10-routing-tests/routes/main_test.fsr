@@ -1,0 +1,164 @@
+// Tests of main.fsr, all expected to pass:
+//   ferrosip test --config ferrosip.toml routes/main_test.fsr
+
+test "OPTIONS is answered here" {
+    send("OPTIONS sip:127.0.0.1")
+    assert(reply_code() == OK)
+    assert(relays() == 0)
+}
+
+test "Max-Forwards 0 gets 483 and goes nowhere" {
+    send("""MESSAGE sip:bob@example.com
+Max-Forwards: 0
+""")
+    assert(reply_code() == TooManyHops)
+    assert(relays() == 0)
+}
+
+test "an unknown method gets 405" {
+    send("PUBLISH sip:bob@example.com")
+    assert(reply_code() == MethodNotAllowed)
+}
+
+test "a REGISTER without credentials is challenged with 401" {
+    send("REGISTER sip:example.com")
+    assert(reply_code() == Unauthorized)
+    assert(reply_reason() == "Unauthorized")
+}
+
+test "an authenticated REGISTER is saved" {
+    auth.check = true
+    location.save = true
+    send("REGISTER sip:example.com")
+    assert(calls(auth.check) == 1)
+    assert(calls(location.save) == 1)
+}
+
+test "an INVITE without credentials is challenged with 407" {
+    send("INVITE sip:bob@example.com")
+    assert(reply_code() == ProxyAuthenticationRequired)
+    assert(relays() == 0)
+}
+
+test "a call to an unregistered user gets 404 Not registered" {
+    auth.check = true
+    location.lookup = false
+    send("INVITE sip:carol@example.com")
+    assert(reply_code() == NotFound)
+    assert(reply_reason() == "Not registered")
+    assert(relays() == 0)
+}
+
+test "a registered callee answers" {
+    auth.check = true
+    location.lookup = true
+    send("INVITE sip:bob@10.0.0.5:5060")
+    assert(relays() == 1)
+    assert(relay_uri() == "sip:bob@10.0.0.5:5060")
+    assert(relay_dest() == "10.0.0.5:5060")
+    answer(OK)
+    assert(reply_code() == OK)
+}
+
+test "busy goes to voicemail" {
+    auth.check = true
+    location.lookup = true
+    send("INVITE sip:bob@10.0.0.5:5060")
+    answer(BusyHere)
+    assert(relays() == 2)
+    assert(relay_uri(2) == "sip:vm@10.0.0.20:5060")
+    answer(OK)
+    assert(reply_code() == OK)
+}
+
+test "no answer within 20s goes to voicemail" {
+    auth.check = true
+    location.lookup = true
+    send("INVITE sip:bob@10.0.0.5:5060")
+    wait(21s)
+    assert(relay_uri(2) == "sip:vm@10.0.0.20:5060")
+    answer(OK)
+    assert(reply_code() == OK)
+}
+
+test "a decline is forwarded, not sent to voicemail" {
+    auth.check = true
+    location.lookup = true
+    send("INVITE sip:bob@10.0.0.5:5060")
+    answer(Decline)
+    assert(relays() == 1)
+    assert(reply_code() == Decline)
+}
+
+test "a number goes to gw1, then gw2 on 503" {
+    auth.check = true
+    send("INVITE sip:+4930123456@example.com", from: "10.1.2.3:5060")
+    assert(relay_dest() == "10.0.0.10:5060")
+    answer(ServiceUnavailable)
+    assert(relay_dest(2) == "10.0.0.11:5060")
+    answer(OK)
+    assert(reply_code() == OK)
+}
+
+test "both gateways failing gives 503 No gateway" {
+    auth.check = true
+    send("INVITE sip:+4930123456@example.com", from: "10.1.2.3:5060")
+    answer(ServiceUnavailable)
+    answer(ServerInternalError)
+    assert(relays() == 2)
+    assert(reply_code() == ServiceUnavailable)
+    assert(reply_reason() == "No gateway")
+}
+
+test "a silent gateway times out after 2s and the next is tried" {
+    auth.check = true
+    send("INVITE sip:+4930123456@example.com", from: "10.1.2.3:5060")
+    wait(3s)
+    assert(relay_dest(2) == "10.0.0.11:5060")
+    answer(OK)
+    assert(reply_code() == OK)
+}
+
+test "a 486 from a gateway ends the call: no failover" {
+    auth.check = true
+    send("INVITE sip:+4930123456@example.com", from: "10.1.2.3:5060")
+    answer(BusyHere)
+    assert(relays() == 1)
+    assert(reply_code() == BusyHere)
+}
+
+test "numbers from outside the trusted network are refused" {
+    auth.check = true
+    send("INVITE sip:+4930123456@example.com", from: "203.0.113.5:5060")
+    assert(reply_code() == Forbidden)
+    assert(relays() == 0)
+    assert(calls(location.lookup) == 0)
+}
+
+test "calls are counted per caller in a shared table" {
+    auth.check = true
+    location.lookup = false
+    send("""INVITE sip:carol@example.com
+From: <sip:alice@example.com>;tag=a1
+""")
+    send("""INVITE sip:carol@example.com
+From: <sip:alice@example.com>;tag=a2
+""")
+    assert(calls.get("alice") == 2)
+}
+
+test "each test starts with empty tables" {
+    assert(!calls.contains("alice"))
+}
+
+test "a missing counter reads 0" {
+    assert(calls.get("nobody") == 0)
+}
+
+test "no final reply yet: reply_code() is 0" {
+    auth.check = true
+    location.lookup = true
+    send("INVITE sip:bob@10.0.0.5:5060")
+    assert(relays() == 1)
+    assert(reply_code() == 0)
+}

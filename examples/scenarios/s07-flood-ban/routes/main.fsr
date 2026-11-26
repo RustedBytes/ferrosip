@@ -1,0 +1,70 @@
+// Flood protection per source address, with an HTTP API for the bans.
+import ip, sip
+import { features } from config
+
+// Requests per source in the current window: the timer empties it every
+// second. The ttl only drops sources that went quiet; it can't be the
+// window, since every update pushes an item's expiry back.
+shared table hits: Map<Str, Counter> ttl 10s
+// A ban is a 5s cool-down: banned sources are dropped before anything
+// touches their item, so it expires 5s after the ban. (A [feature] can't
+// be a Duration, so the time is written here.)
+shared table bans: Map<Str, Bool> ttl 5s
+shared table stats: Map<Str, Counter>
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    // ip:port: phones behind one NAT aren't punished together.
+    let who = "{msg.src.ip}:{msg.src.port}"
+    if bans.contains(who) {
+        drop
+    }
+    if hits.incr(who) > features.flood_limit {
+        bans.set(who, true)
+        stats.incr("bans")
+        log.warn("banned {who}\n")
+        drop
+    }
+    if msg.method == OPTIONS && sip.options_reply() {
+        exit
+    }
+    guard ip.in_subnet(msg.src.ip, features.trusted) else reply(Forbidden, "Not trusted")
+    msg.dst_uri = features.upstream
+    relay(msg)
+}
+
+// The window: counters start again every second.
+on timer(every: 1s) {
+    hits.clear()
+    stats.incr("sweeps")
+}
+
+// GET /bans: how many; GET /bans?<ip:port>: is it banned.
+on http(req: HttpRequest) where req.path == "/bans" && req.method == "GET" {
+    if req.query != "" {
+        if bans.contains(req.query) {
+            req.reply(200, "banned\n")
+        }
+        req.reply(404, "not banned\n")
+    }
+    // .fsr can't walk a table: htable's $shtcn counts the keys.
+    req.reply(200, "{pv("$shtcn(bans=>~~.)")}\n")
+}
+
+// DELETE /bans?<ip:port>: lift one ban; DELETE /bans: lift them all.
+on http(req: HttpRequest) where req.path == "/bans" && req.method == "DELETE" {
+    if req.query != "" {
+        bans.remove(req.query)
+        req.reply(204)
+    }
+    bans.clear()
+    req.reply(204)
+}
+
+on http(req: HttpRequest) where req.path == "/stats" && req.method == "GET" {
+    req.reply(200, "bans={stats.get("bans")} sweeps={stats.get("sweeps")}\n")
+}
+
+on http(req: HttpRequest) {
+    req.reply(404, "no such resource\n")
+}

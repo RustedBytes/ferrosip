@@ -1,0 +1,18 @@
+# l05-lb-cluster / app: one of three identical application proxies behind
+# the load balancer (APP_NAME tells them apart). Relays to the UAS.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-l05-app.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${APP_PORT:-5071}"
+
+[feature]
+name = "${APP_NAME:-app1}"
+uas = "${UAS:-sip:127.0.0.1:5080}"
+trusted = "${TRUSTED:-127.0.0.0/8}"
+
+[routing]
+entry = "routes/main.fsr"

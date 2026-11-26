@@ -1,0 +1,21 @@
+# m10-cdr: every call is a tracked dialog; when it ends, a CDR (JSON) is
+# POSTed to a collector. Prepaid callers' calls are cut after 3s.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m10.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+callee = "${CALLEE:-sip:127.0.0.1:5080}"           # the PBX behind us
+collector = "${COLLECTOR:-http://127.0.0.1:8090}"  # the CDR collector
+trusted = "${TRUSTED:-127.0.0.0/8}"
+
+[modules.http_client]    # blocking HTTP: event handlers can't await
+connection_timeout = "1s"
+
+[routing]
+entry = "routes/main.fsr"

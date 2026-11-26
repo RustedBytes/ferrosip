@@ -1,0 +1,22 @@
+# m12-topology-hiding: a border proxy between the internal network and a
+# carrier. topoh hides the internal Vias and Contacts (and masks them with
+# MASK_IP); in-dialog requests are routed back by the hidden data.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m12.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+carrier = "${CARRIER:-sip:127.0.0.1:5080}"   # outside
+internal = "${INTERNAL:-127.0.0.0/8}"        # who may place calls out
+
+[modules.topology]       # topoh
+mask_ip = "${MASK_IP:-198.51.100.10}"        # the address the outside sees in Contacts
+mask_key = "${MASK_KEY:-m12-scenario-key}"
+
+[routing]
+entry = "routes/main.fsr"

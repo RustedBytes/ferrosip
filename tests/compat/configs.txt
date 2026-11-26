@@ -1,0 +1,47 @@
+# Kamailio configs that `ferrosip -c` must accept: path [DEFINE ...]
+# (paths under tests/compat/kamailio/). One line per run; the stock
+# kamailio.cfg is checked with each WITH_* feature and with most of them on.
+etc/kamailio.cfg
+etc/kamailio.cfg WITH_DEBUG
+etc/kamailio.cfg WITH_MYSQL WITH_AUTH
+etc/kamailio.cfg WITH_MYSQL WITH_AUTH WITH_IPAUTH
+etc/kamailio.cfg WITH_MYSQL WITH_AUTH WITH_USRLOCDB
+etc/kamailio.cfg WITH_NAT WITH_RTPENGINE
+etc/kamailio.cfg WITH_NAT WITH_NATSIPPING WITH_RTPENGINE
+etc/kamailio.cfg WITH_RTPENGINE
+etc/kamailio.cfg WITH_TLS
+etc/kamailio.cfg WITH_MYSQL WITH_PRESENCE
+etc/kamailio.cfg WITH_MYSQL WITH_ALIASDB
+etc/kamailio.cfg WITH_MYSQL WITH_SPEEDDIAL
+etc/kamailio.cfg WITH_MYSQL WITH_MULTIDOMAIN
+etc/kamailio.cfg WITH_PSTN
+etc/kamailio.cfg WITH_ANTIFLOOD
+etc/kamailio.cfg WITH_BLOCK3XX
+etc/kamailio.cfg WITH_BLOCK401407
+etc/kamailio.cfg WITH_MYSQL WITH_VOICEMAIL
+etc/kamailio.cfg WITH_MYSQL WITH_ACCDB
+etc/kamailio.cfg WITH_HTABLE
+etc/kamailio.cfg WITH_MSGREBUILD
+etc/kamailio.cfg WITH_SIPINTERCONNECT
+etc/kamailio.cfg WITH_MYSQL WITH_AUTH WITH_USRLOCDB WITH_IPAUTH WITH_PRESENCE WITH_ALIASDB WITH_SPEEDDIAL WITH_MULTIDOMAIN WITH_PSTN WITH_ANTIFLOOD WITH_NAT WITH_RTPENGINE WITH_TLS WITH_HTABLE WITH_ACCDB WITH_VOICEMAIL WITH_DEBUG WITH_BLOCK3XX WITH_BLOCK401407 WITH_MSGREBUILD WITH_SIPINTERCONNECT
+misc/examples/exec/exec.cfg
+misc/examples/exec/exec_s2.cfg
+misc/examples/kamailio/acc-mysql.cfg
+misc/examples/kamailio/acc.cfg
+misc/examples/kamailio/exec_s3.cfg
+misc/examples/kamailio/exec_s5.cfg
+misc/examples/kamailio/fork.cfg
+misc/examples/kamailio/logging.cfg
+misc/examples/kamailio/msilo.cfg
+misc/examples/kamailio/redirect.cfg
+misc/examples/kamailio/serial_183.cfg
+misc/examples/mixed/acc.cfg
+misc/examples/mixed/ccdiversion.cfg
+misc/examples/mixed/kamailio-minimal-proxy.cfg
+misc/examples/mixed/logging.cfg
+misc/examples/mixed/onr.cfg
+misc/examples/mixed/redirect.cfg
+misc/examples/mixed/serial_183.cfg
+misc/examples/mixed/uas.cfg
+misc/examples/pkg/kamailio-basic.cfg
+misc/examples/pkg/kamailio-oob.cfg

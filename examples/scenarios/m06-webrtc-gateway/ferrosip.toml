@@ -1,0 +1,26 @@
+# m06-webrtc-gateway: browsers (SIP over WebSocket, RFC 7118) and UDP
+# phones register at the same proxy and call each other.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m06.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[[listen]]
+proto = "ws"
+addr = "127.0.0.1:${WS_PORT:-8080}"
+
+[feature]
+realm = "example.com"
+
+[modules.auth]
+users_file = "${USERS_FILE:-users}"
+
+[modules.location]
+handle_lost_tcp = true   # a closed browser tab unregisters at once
+
+[routing]
+entry = "routes/main.fsr"

@@ -1,0 +1,7 @@
+<?xml version="1.0"?><IMSSubscription><PrivateID>alice@ims.test</PrivateID><ServiceProfile>
+<PublicIdentity><Identity>sip:alice@ims.test</Identity></PublicIdentity><PublicIdentity><Identity>tel:+4930111</Identity></PublicIdentity>
+<InitialFilterCriteria><Priority>0</Priority><TriggerPoint><ConditionTypeCNF>1</ConditionTypeCNF>
+<SPT><ConditionNegated>0</ConditionNegated><Group>0</Group><Method>INVITE</Method></SPT>
+<SPT><ConditionNegated>0</ConditionNegated><Group>1</Group><SessionCase>0</SessionCase></SPT></TriggerPoint>
+<ApplicationServer><ServerName>sip:127.0.0.1:6799</ServerName><DefaultHandling>0</DefaultHandling></ApplicationServer></InitialFilterCriteria>
+</ServiceProfile></IMSSubscription>

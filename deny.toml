@@ -1,0 +1,55 @@
+# cargo-deny: licenses, advisories, banned crates and sources.
+# CI runs `cargo deny check` (job `supply-chain`); run it locally the same way.
+
+[graph]
+# The platforms ferrosip ships for; Windows/wasm-only crates don't count.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# ferrosip is GPL-3.0-or-later. Everything below can be combined with it
+# (Apache-2.0 is compatible with GPLv3).
+allow = [
+    "GPL-3.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "BSL-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+
+# webpki 0.22 (via mysql) ships its ISC license text in a form the scanner
+# scores just under the threshold.
+[[licenses.clarify]]
+crate = "webpki"
+expression = "ISC"
+license-files = [{ path = "LICENSE", hash = 0x001c7e6c }]
+
+[bans]
+# Duplicate versions are reported but don't fail the build: most are
+# transitive (getrandom, sha2, digest generations) and not ours to unify.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # TLS is rustls only; no C TLS stack.
+    { name = "openssl-sys", reason = "ferrosip uses rustls; a C TLS stack must not creep in" },
+    { name = "native-tls", reason = "ferrosip uses rustls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

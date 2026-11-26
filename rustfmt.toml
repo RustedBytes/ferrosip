@@ -1,0 +1,4 @@
+# Matches the code base's existing style: long single-line expressions are
+# kept, so formatting only reflows genuinely long lines.
+max_width = 160
+use_small_heuristics = "Max"

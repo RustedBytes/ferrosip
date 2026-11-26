@@ -1,0 +1,22 @@
+# m16-json-webhooks: every new call is POSTed as a JSON event to a webhook;
+# the webhook's JSON answer routes it (to a target, or a rejection). When
+# the answer is unusable the call takes the fallback, saying why.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m16.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+webhook = "${WEBHOOK_URL:-http://127.0.0.1:8090/call}"   # gets the events
+fallback = "${FALLBACK:-sip:127.0.0.1:5090}"            # when the answer is unusable
+trusted = "${TRUSTED:-127.0.0.0/8}"
+
+[modules.http_async_client]
+workers = 4
+
+[routing]
+entry = "routes/main.fsr"

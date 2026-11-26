@@ -1,0 +1,86 @@
+// A JSON webhook per call: the event is built with json_doc, the answer is
+// read with json_doc and decides the routing.
+import http, json_doc, ip, route_set
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    guard ip.in_subnet(msg.src.ip, features.trusted) else reply(Forbidden, "Not trusted")
+    if msg.has_to_tag {
+        guard route_set.follow() else reply(NotFound, "Not here")
+        relay(msg)
+    }
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    if msg.method != INVITE {
+        reply(MethodNotAllowed)
+    }
+    route_set.record()
+    // The event. json_doc escapes every value: quotes, backslashes,
+    // control characters and UTF-8 in a display name stay valid JSON.
+    let ev = ""
+    json_doc.set("string", "event", "call.new", ev)
+    json_doc.set("string", "call_id", msg.call_id, ev)
+    json_doc.set("string", "from.user", msg.from.user, ev)
+    json_doc.set("string", "from.display", msg.from.display, ev)
+    json_doc.set("string", "to", msg.ruri.user, ev)
+    json_doc.set("integer", "cseq", "{msg.cseq}", ev)
+    if msg.headers.has("Subject") {
+        json_doc.set("string", "subject", msg.headers["Subject"], ev)
+    }
+    if msg.has_sdp {
+        json_doc.set("string", "sdp", msg.body, ev)
+    }
+    let r = await http.post(features.webhook, ev, timeout: 2s)
+    guard r.ok else fallback(msg, "error {r.error}")
+    guard r.status == 200 else fallback(msg, "status {r.status}")
+    let action = ""
+    guard json_doc.get("action", r.body, action) else fallback(msg, "no action")
+    match action {
+        "route" => route_to(msg, r.body)
+        "reject" => reject(msg, r.body)
+        _ => fallback(msg, "unknown action")
+    }
+}
+
+// {"action": "route", "route": {"uri": "sip:ip:port", "account": "…"}}
+fn route_to(msg: Request, answer: Str) -> Action {
+    let uri = ""
+    guard json_doc.get("route.uri", answer, uri) else fallback(msg, "no route.uri")
+    guard uri =~ "^sip:[0-9.]+:[0-9]+$" else fallback(msg, "bad route.uri")
+    let account = ""
+    if json_doc.get("route.account", answer, account) {
+        // A value from the answer goes into a header: no CR, LF or other
+        // control characters.
+        guard !(account =~ "[[:cntrl:]]") else fallback(msg, "bad route.account")
+        msg.headers["X-Account"] = account
+    }
+    msg.dst_uri = uri
+    relay(msg)
+}
+
+// {"action": "reject", "code": 486, "reason": "…"}: one of the codes the
+// webhook may use (after `await`, reply() takes a constant code).
+fn reject(msg: Request, answer: Str) -> Action {
+    let code: Int = 0
+    let reason = "Rejected"
+    guard json_doc.get("code", answer, code) else fallback(msg, "no code")
+    json_doc.get("reason", answer, reason)
+    guard !(reason =~ "[[:cntrl:]]") else fallback(msg, "bad reason")
+    match code {
+        Forbidden => reply(Forbidden, reason)
+        NotFound => reply(NotFound, reason)
+        TemporarilyUnavailable => reply(TemporarilyUnavailable, reason)
+        BusyHere => reply(BusyHere, reason)
+        Decline => reply(Decline, reason)
+        _ => fallback(msg, "bad code")
+    }
+}
+
+fn fallback(msg: Request, why: Str) -> Action {
+    log.warn("webhook: {why}, {msg.call_id} goes to the fallback\n")
+    msg.headers["X-Webhook-Fallback"] = why
+    msg.dst_uri = features.fallback
+    relay(msg)
+}

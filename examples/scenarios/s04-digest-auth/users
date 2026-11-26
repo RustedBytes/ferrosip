@@ -1,0 +1,4 @@
+# user password | user md5:HA1 | user sha256:HA1 (realm example.com)
+alice secret-a
+bob sha256:dd0e395263755a66bc161dd47b811fe569f475342103e981e9b2407d9c65b186
+carol md5:9858d729ace31de983cc46f8eb53ec78

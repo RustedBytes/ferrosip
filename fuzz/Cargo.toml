@@ -1,0 +1,84 @@
+[package]
+name = "ferrosip-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+authors = ["Yehor Smoliakov <egorsmkv@gmail.com>"]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bumpalo = "3"
+sip-parser = { path = "../crates/sip-parser" }
+sip-core = { path = "../crates/sip-core" }
+sip-script = { path = "../crates/sip-script" }
+sip-transport = { path = "../crates/sip-transport" }
+sip-diameter = { path = "../crates/sip-diameter" }
+mod-media = { path = "../crates/mod-media" }
+mod-ims = { path = "../crates/mod-ims" }
+serde_json = "1"
+
+# Its own workspace: built with nightly by cargo-fuzz, not by `cargo build`.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "sip_msg"
+path = "fuzz_targets/sip_msg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "script"
+path = "fuzz_targets/script.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ws"
+path = "fuzz_targets/ws.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "diameter"
+path = "fuzz_targets/diameter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bencode"
+path = "fuzz_targets/bencode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ims_xml"
+path = "fuzz_targets/ims_xml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pv"
+path = "fuzz_targets/pv.rs"
+test = false
+doc = false
+bench = false

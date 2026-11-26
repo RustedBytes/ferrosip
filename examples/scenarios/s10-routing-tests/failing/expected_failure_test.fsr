@@ -1,0 +1,9 @@
+// Deliberately failing: the runner must report it and exit non-zero.
+//   ferrosip test --config ferrosip.toml failing/expected_failure_test.fsr
+
+test "deliberately wrong: an unregistered user does not get 200" {
+    auth.check = true
+    location.lookup = false
+    send("INVITE sip:carol@example.com")
+    assert(reply_code() == OK)
+}

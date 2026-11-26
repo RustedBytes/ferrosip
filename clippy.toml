@@ -1,0 +1,7 @@
+# Tests and their helpers may unwrap / expect / panic / index (the
+# workspace denies clippy::unwrap_used, expect_used, panic and
+# indexing_slicing elsewhere).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

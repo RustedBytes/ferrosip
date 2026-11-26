@@ -1,0 +1,24 @@
+# l05-lb-cluster / lb: round robin over three application proxies,
+# probing them with OPTIONS; a dead one is failed over and taken out.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-l05-lb.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${LB_PORT:-5060}"
+
+[feature]
+trusted = "${TRUSTED:-127.0.0.0/8}"
+
+[modules.balancer]
+list_file = "${DISPATCHER_LIST:-dispatcher.list}"
+ds_ping_interval = "1s"
+ds_probing_mode = "all"        # probe every destination, not only inactive ones
+
+[modules.txn]
+fr_timer = "1s"                # an app proxy that sends nothing is down after 1s
+
+[routing]
+entry = "routes/main.fsr"

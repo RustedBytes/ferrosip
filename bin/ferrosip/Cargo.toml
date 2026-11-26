@@ -1,0 +1,70 @@
+[package]
+name = "ferrosip"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+bumpalo.workspace = true
+sip-parser.workspace = true
+fsr.workspace = true
+sip-core.workspace = true
+sip-script.workspace = true
+sip-transport.workspace = true
+mod-txn.workspace = true
+mod-maxfwd.workspace = true
+mod-location.workspace = true
+mod-auth.workspace = true
+mod-sip.workspace = true
+mod-routing.workspace = true
+mod-limits.workspace = true
+mod-dialog.workspace = true
+mod-media.workspace = true
+mod-carrier.workspace = true
+mod-presence.workspace = true
+mod-extra.workspace = true
+mod-lua = { workspace = true, optional = true }
+mod-webui = { workspace = true, optional = true }
+mod-ai = { workspace = true, optional = true }
+mod-prometheus = { workspace = true, optional = true }
+mod-ims.workspace = true
+mod-async.workspace = true
+mod-ops.workspace = true
+signal-hook.workspace = true
+sip-db.workspace = true
+mimalloc = { version = "0.1", default-features = false, optional = true }
+toml = "1"
+
+# Optional stacks. On by default: SQLite, Lua, HTTP, web UI, AI, Prometheus.
+# Off by default: the MySQL and PostgreSQL drivers (together about 115 of
+# the build's crates) and mimalloc. With every database driver:
+#   cargo build --release -p ferrosip --features db-all
+# The leanest build:
+#   cargo build --release -p ferrosip --no-default-features
+[features]
+default = ["db-sqlite", "lua", "http", "webui", "ai", "prometheus"]
+# Database drivers for db_url (text:// is always available).
+db-sqlite = ["sip-db/sqlite"]
+db-mysql = ["sip-db/mysql"]
+db-postgres = ["sip-db/postgres"]
+db-all = ["db-sqlite", "db-mysql", "db-postgres"]
+# app_lua (vendored Lua 5.4 via mlua).
+lua = ["dep:mod-lua"]
+# The read-only admin web UI (loadmodule "webui").
+webui = ["dep:mod-webui"]
+# Voice AI calls: OpenAI Realtime / Gemini Live (loadmodule "ai").
+ai = ["dep:mod-ai"]
+# Prometheus exporter with labels and latency histograms (loadmodule "prometheus").
+prometheus = ["dep:mod-prometheus"]
+# http_client / http_async_client (ureq).
+http = ["mod-async/http"]
+# mimalloc as the global allocator. Off by default (glibc's malloc is fine);
+# the Docker image turns it on, because musl's malloc is slow under
+# multithreaded load.
+mimalloc = ["dep:mimalloc"]
+
+[lints]
+workspace = true

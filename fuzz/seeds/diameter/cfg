@@ -1,0 +1,1 @@
+<DiameterPeer FQDN="a" Realm="r"><Peer FQDN="b" Realm="r" port="3868" host="1.2.3.4"/><Acceptor port="3868"/><DefaultRoute FQDN="b" metric="10"/></DiameterPeer>

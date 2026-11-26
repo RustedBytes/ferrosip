@@ -1,0 +1,34 @@
+# l04-small-business-pbx / pbx: extensions 100-199 register here; calls
+# ring the callee, then go to voicemail on busy or no answer; per-user
+# call forwarding is set over HTTP; the receptionist watches an
+# extension's line (BLF, dialog-info); every call leaves a CDR in the log.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-l04.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+domain = "pbx.example.com"
+self_port = "${SIP_PORT:-5060}"         # our own PUBLISHes (BLF) come from here
+voicemail = "${VOICEMAIL:-sip:127.0.0.1:5090}"
+
+[modules.auth]
+users_file = "${USERS_FILE:-users}"
+
+[modules.location]
+max_expires = "1h"
+
+[modules.http]
+listen = "127.0.0.1:${HTTP_PORT:-8080}"   # the forwarding API: local only
+
+[modules.presence_dialoginfo]             # the dialog event package (BLF)
+
+[modules.pua_dialoginfo]
+presence_server = "sip:127.0.0.1:${SIP_PORT:-5060}"   # publish to ourselves
+
+[routing]
+entry = "routes/main.fsr"

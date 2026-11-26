@@ -1,0 +1,30 @@
+# m07-load-balancer: calls are spread round-robin over a pool of three
+# application servers (Kamailio dispatcher). Dead servers are found by
+# OPTIONS probes and skipped; a server that fails a call is skipped too.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m07.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+trusted = "${TRUSTED:-127.0.0.0/8}"
+
+[modules.txn]
+fr_timer = "1s"          # a server (or probe) without any answer fails after 1s
+fr_inv_timer = "30s"
+
+[modules.balancer]       # dispatcher
+list_file = "${DS_LIST:-dispatcher.list}"
+ds_ping_interval = "1s"
+ds_probing_mode = "all"  # probe every destination, not only those already failing
+ds_ping_from = "sip:balancer@example.com"
+
+[modules.http]           # xhttp: the on http handler (destination states)
+listen = "127.0.0.1:${HTTP_PORT:-8080}"
+
+[routing]
+entry = "routes/main.fsr"

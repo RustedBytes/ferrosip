@@ -1,0 +1,36 @@
+// Registrar and proxy: authenticate everything, register, and route calls
+// to every registered contact of the callee (parallel forking).
+import auth, location, route_set
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    if msg.has_to_tag {
+        return in_dialog(msg)
+    }
+    // A CANCEL finds its INVITE's transaction: no credentials needed.
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    guard auth.check(features.realm) else auth.challenge(features.realm)
+    auth.consume_credentials()
+    if msg.method == REGISTER {
+        location.save()
+    }
+    // Unknown users don't exist here at all; known ones may just be offline.
+    guard msg.ruri.user =~ "^({features.users})$" else reply(NotFound)
+    route_set.record()
+    guard location.lookup() else reply(TemporarilyUnavailable)
+    relay(msg)
+}
+
+fn in_dialog(msg: Request) -> Action {
+    if route_set.follow() {
+        relay(msg)
+    }
+    if msg.method == ACK {
+        // The ACK of a negative final we sent: the transaction absorbs it.
+        drop
+    }
+    reply(NotFound, "Not here")
+}

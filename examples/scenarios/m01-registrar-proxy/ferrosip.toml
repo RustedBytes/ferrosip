@@ -1,0 +1,29 @@
+# m01-registrar-proxy: one proxy that authenticates, registers and routes
+# calls to the registered contacts of a user, forking in parallel.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m01.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+realm = "example.com"
+# The users of the domain, as a regex alternation. A call to one of them
+# who has no registered contact gets 480; anybody else is unknown: 404.
+# Keep it in step with the users file.
+users = "${USERS:-alice|bob|carol}"
+
+[modules.auth]
+users_file = "${USERS_FILE:-users}"
+
+[modules.location]
+max_expires = "1h"
+
+[modules.txn]
+fr_inv_timer = "60s"     # how long a call may ring
+
+[routing]
+entry = "routes/main.fsr"

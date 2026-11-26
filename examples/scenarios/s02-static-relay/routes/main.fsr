@@ -1,0 +1,10 @@
+// A static relay: everything from a trusted source goes to one upstream.
+import ip
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    guard ip.in_subnet(msg.src.ip, features.trusted) else reply(Forbidden, "Not trusted")
+    msg.dst_uri = features.upstream
+    relay(msg)
+}

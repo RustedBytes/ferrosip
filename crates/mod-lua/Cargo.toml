@@ -1,0 +1,16 @@
+[package]
+name = "mod-lua"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+sip-parser.workspace = true
+sip-core.workspace = true
+mlua = { version = "0.12", features = ["lua54", "vendored"] }
+
+[lints]
+workspace = true

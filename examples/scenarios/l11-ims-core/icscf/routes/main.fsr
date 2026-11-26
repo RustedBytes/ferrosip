@@ -1,0 +1,24 @@
+// I-CSCF: find the S-CSCF of the user with the HSS (UAR for a REGISTER,
+// LIR for the rest) and forward there. Not in any dialog's route set.
+import ims_icscf
+
+// Every relay goes to an S-CSCF the HSS named for a user it knows (UAR /
+// LIR): that is the I-CSCF's check.
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    guard !msg.has_to_tag else reply(Forbidden, "Not in this dialog")
+    if msg.method == REGISTER {
+        let uar = await ims_icscf.authorize()
+        guard uar.code != -2 else reply(Forbidden, "User Unknown")
+        guard uar.code != -3 else reply(Forbidden, "Identities don't match")
+        guard uar.code != -4 else reply(Forbidden, "Roaming not allowed")
+        guard uar.code == 1 else reply(ServerInternalError, "HSS error (UAR {uar.code})")
+        guard ims_icscf.select_scscf() else reply(ServerInternalError, "No S-CSCF")
+        relay(msg)
+    }
+    let lir = await ims_icscf.locate()
+    guard lir.code != -2 else reply(NotFound, "User Unknown")
+    guard lir.code == 1 else reply(ServerInternalError, "HSS error (LIR {lir.code})")
+    guard ims_icscf.select_scscf() else reply(ServerInternalError, "No S-CSCF")
+    relay(msg)
+}

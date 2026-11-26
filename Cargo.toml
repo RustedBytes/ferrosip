@@ -1,0 +1,100 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "bin/ferrosip", "tools/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.100"
+version = "0.1.0"
+license = "GPL-3.0-or-later"
+authors = ["Yehor Smoliakov <egorsmkv@gmail.com>"]
+publish = false
+
+[workspace.dependencies]
+signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }
+bumpalo = { version = "3", features = ["collections"] }
+memchr = "2"
+serde_json = "1"
+flate2 = "1"
+socket2 = { version = "0.6", features = ["all"] }
+mio = { version = "1", features = ["os-poll", "os-ext", "net"] }
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sip-parser = { path = "crates/sip-parser" }
+sip-core = { path = "crates/sip-core" }
+# Drivers are chosen by the binary (bin/ferrosip features), not by modules.
+sip-db = { path = "crates/sip-db", default-features = false }
+sip-script = { path = "crates/sip-script" }
+fsr = { path = "crates/fsr" }
+sip-transport = { path = "crates/sip-transport" }
+mod-txn = { path = "crates/mod-txn" }
+mod-maxfwd = { path = "crates/mod-maxfwd" }
+mod-location = { path = "crates/mod-location" }
+mod-auth = { path = "crates/mod-auth" }
+mod-sip = { path = "crates/mod-sip" }
+mod-routing = { path = "crates/mod-routing" }
+mod-limits = { path = "crates/mod-limits" }
+mod-dialog = { path = "crates/mod-dialog" }
+mod-media = { path = "crates/mod-media" }
+mod-carrier = { path = "crates/mod-carrier" }
+mod-presence = { path = "crates/mod-presence" }
+mod-extra = { path = "crates/mod-extra" }
+mod-lua = { path = "crates/mod-lua" }
+sip-diameter = { path = "crates/sip-diameter" }
+mod-ims = { path = "crates/mod-ims" }
+mod-async = { path = "crates/mod-async", default-features = false }
+mod-ops = { path = "crates/mod-ops" }
+mod-webui = { path = "crates/mod-webui" }
+mod-ai = { path = "crates/mod-ai" }
+mod-prometheus = { path = "crates/mod-prometheus" }
+
+# Lints every crate opts into with `[lints] workspace = true`.
+[workspace.lints.rust]
+# No unsafe code anywhere, and no `#[allow]` can turn it back on: syscalls
+# go through safe wrappers (rustix) or /proc.
+unsafe_code = "forbid"
+# sip_core::limit's loom models (RUSTFLAGS="--cfg loom").
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[workspace.lints.clippy]
+# Tests may unwrap (clippy.toml); elsewhere handle the error, or allow it
+# where it can't happen, saying why.
+unwrap_used = "deny"
+# Widening numeric conversions are written `From`/`into()`, so a later
+# change of type that makes them lossy fails to compile instead of
+# silently becoming a truncating `as`.
+cast_lossless = "deny"
+# Narrowing or sign-changing conversions say what happens out of range
+# (`try_from` and reject, or saturate); the few deliberate truncations
+# (hash folding, mod-2^32 protocol fields, float → int) carry a narrow
+# `#[allow(…, reason = "…")]`.
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+# Byte-index slicing of a str panics off a char boundary: input from the
+# wire or a config file must never be able to do that.
+string_slice = "deny"
+# Like unwrap_used: outside tests, errors are handled, not panicked on.
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+mem_forget = "deny"
+# Every #[allow] says why.
+allow_attributes_without_reason = "deny"
+# No index or slice that can panic, and no integer arithmetic that can
+# overflow, outside tests: iterate, pattern-match or `.get()`, and say what
+# happens at the limit (checked → reject, saturating → clamp, wrapping for
+# protocol fields defined modulo 2^n and Kamailio's C-int script math).
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+
+# Kamailio builds with -O2/-O3 and arch flags; we do the Rust equivalent.
+[profile.release]
+# Arithmetic is explicit everywhere (clippy::arithmetic_side_effects), so
+# this costs nothing measurable; it turns any overflow that slips past the
+# lint (a dependency, a macro) into a caught panic instead of a silent wrap.
+overflow-checks = true
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 1

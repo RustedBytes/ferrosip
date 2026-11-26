@@ -1,0 +1,4 @@
+# setid uri: the pool of application servers (set 1).
+1 sip:127.0.0.1:5071
+1 sip:127.0.0.1:5072
+1 sip:127.0.0.1:5073

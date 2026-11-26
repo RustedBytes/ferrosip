@@ -1,0 +1,19 @@
+[package]
+name = "sipflood"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+sip-parser.workspace = true
+sip-core.workspace = true
+bumpalo.workspace = true
+socket2.workspace = true
+sip-transport.workspace = true
+rustls.workspace = true
+
+[lints]
+workspace = true

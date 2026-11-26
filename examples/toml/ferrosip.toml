@@ -1,0 +1,59 @@
+# ferrosip.toml: what runs. Routing is in routes/main.cfg.
+#
+#   ferrosip --config examples/toml/ferrosip.toml
+#   ferrosip check --config examples/toml/ferrosip.toml --overlay examples/toml/envs/prod.toml --explain
+#   ferrosip schema txn location          # parameter reference
+
+[core]
+workers = 4
+log_level = "info"
+rpc_socket = "${FERROSIP_RPC:-/tmp/ferrosip-rpc.sock}"
+shutdown_timeout = "5s"
+
+[[listen]]
+proto = "udp"
+addr = "${SIP_ADDR:-127.0.0.1}:5060"
+
+[[listen]]
+proto = "tcp"
+addr = "${SIP_ADDR:-127.0.0.1}:5060"
+
+[feature]
+nat = false
+metrics = true
+
+[modules.txn]                     # Kamailio tm
+fr_timer = "10s"
+fr_inv_timer = "60s"
+
+[modules.location]                # usrloc + registrar
+# db_mode = "off"   # the default; "write-through" keeps registrations in db_url
+# default_expires = "1h"   # the default
+max_expires = "2h"
+max_contacts = 5
+
+[modules.route_set]               # rr
+# append_fromtag = true   # the default
+
+[modules.dialog]
+default_timeout = "4h"
+profiles_no_value = "calls"
+
+[modules.limits]                  # pike (+ ratelimit)
+# sampling_time_unit = "2s"   # the default
+reqs_density_per_unit = 50
+
+[modules.nat]                     # nathelper
+enabled = "${feature.nat}"
+natping_interval = "30s"
+
+[modules.prometheus]
+enabled = "${feature.metrics}"
+listen = "127.0.0.1:9095"
+
+[routing]
+entry = "routes/main.cfg"
+
+[lint]
+# The routing is a minimal demo without authentication (see its header).
+allow = ["open_relay", "register_without_auth"]

@@ -1,0 +1,50 @@
+// Message edits on the way to one upstream: headers added, replaced and
+// removed, bodies rewritten, the R-URI user normalised.
+import ip, text
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    guard ip.in_subnet(msg.src.ip, features.trusted) else reply(Forbidden, "Not trusted")
+
+    // Headers: internal ones never leave, ours are added or replaced.
+    text.remove_header("X-Secret")
+    text.append_header("X-Proxy: s06\r\n")
+    msg.headers["X-Tenant"] = "acme"
+    if msg.headers.has("X-Long") {
+        msg.headers["X-Echo"] = msg.headers["X-Long"]
+    }
+
+    // R-URI user: a national number gets the country code, an alias its user.
+    if msg.ruri.user =~ "^0[1-9]" {
+        text.subst_user("/^0/+49/")
+    }
+    if msg.ruri.user == "support" {
+        msg.ruri.user = "alice"
+    }
+
+    // Bodies: card numbers are masked, SDP gets the media address, and two
+    // test headers replace or drop the body.
+    if text.has_body("text/plain") {
+        // `{…}` in a string interpolates: a regex repetition is `\{4\}`.
+        text.replace_body_all("[0-9]\{4\}-[0-9]\{4\}-[0-9]\{4\}-[0-9]\{4\}", "XXXX-XXXX-XXXX-XXXX")
+    }
+    if msg.has_sdp {
+        text.replace_body_all("c=IN IP4 [0-9.]+", "c=IN IP4 {features.media_ip}")
+    }
+    if msg.headers.has("X-Set-Body") {
+        text.set_body("replaced by the proxy\n", "text/plain")
+    }
+    if msg.headers.has("X-Drop-Body") {
+        text.remove_body()
+    }
+
+    msg.dst_uri = features.upstream
+    relay(msg)
+}
+
+// Replies: the upstream's internal header is removed, ours added.
+on reply(r: Reply) {
+    text.remove_header("X-Internal")
+    text.append_header("X-Replied-Via: s06\r\n")
+}

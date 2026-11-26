@@ -1,0 +1,23 @@
+# m14-lua-routing: the routing decision is made in Lua (app_lua). The .fsr
+# checks the request, picks the Lua function by tenant, and relays where
+# Lua pointed it; Lua reads the message through KSR, sets headers, picks
+# the target or rejects.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m14.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+trusted = "${TRUSTED:-127.0.0.0/8}"
+
+[modules.lua]
+# Relative to this directory. The Lua code reads its targets from the
+# environment: PBX (default sip:127.0.0.1:5070) and GATEWAY (5080).
+load = "${LUA_SCRIPT:-routes/route.lua}"
+
+[routing]
+entry = "routes/main.fsr"

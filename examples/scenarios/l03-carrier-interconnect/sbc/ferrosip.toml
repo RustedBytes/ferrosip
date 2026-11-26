@@ -1,0 +1,35 @@
+# l03-carrier-interconnect / sbc: customers authenticate, numbers are
+# normalised to E.164, calls go to carrier 1 and fail over to carrier 2,
+# the carriers never see the customers' addresses, and every call ends in
+# a CDR posted to a collector.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-l03.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+realm = "sbc.example.com"
+carrier1 = "${CARRIER1:-sip:127.0.0.1:5081}"
+carrier2 = "${CARRIER2:-sip:127.0.0.1:5082}"
+country_code = "49"
+calls_per_window = 5      # per customer, per pipe_limits window (5s)
+cdr_url = "${CDR_URL:-http://127.0.0.1:8080/cdr}"
+
+[modules.auth]
+users_file = "${USERS_FILE:-customers}"
+
+[modules.txn]
+fr_timer = "1s"           # a carrier that sends nothing is down after 1s
+
+[modules.pipe_limits]
+timer_interval = "5s"     # the rate window
+
+[modules.topology]
+mask_ip = "127.0.0.1"     # masked Contacts point here (the SBC)
+
+[routing]
+entry = "routes/main.fsr"

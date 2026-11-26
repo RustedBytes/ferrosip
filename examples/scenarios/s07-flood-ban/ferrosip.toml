@@ -1,0 +1,27 @@
+# s07-flood-ban: count requests per source in shared tables, ban a source
+# that sends too many, sweep the counters every second, and list or lift
+# bans over HTTP.
+#
+#   ferrosip --config examples/scenarios/s07-flood-ban/ferrosip.toml
+#   curl http://127.0.0.1:8080/bans                    # how many bans
+#   curl http://127.0.0.1:8080/bans?127.0.0.1:5062     # is this source banned
+#   curl -X DELETE http://127.0.0.1:8080/bans          # lift them all
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-s07.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+upstream = "${UPSTREAM:-sip:127.0.0.1:5080}"
+trusted = "${TRUSTED:-127.0.0.0/8}"
+flood_limit = 10               # requests per source and second (the timer's window)
+
+[modules.http]                 # xhttp: the `on http` handlers
+listen = "127.0.0.1:${HTTP_PORT:-8080}"
+
+[routing]
+entry = "routes/main.fsr"

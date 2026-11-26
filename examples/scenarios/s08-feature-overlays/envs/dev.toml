@@ -1,0 +1,13 @@
+# Development: no authentication, debug headers, short timers, chatty logs.
+# Merged over ../ferrosip.toml (tables merge, values replace).
+
+[core]
+log_level = "debug"
+
+[feature]
+env_name = "dev"
+require_auth = false
+debug_headers = true
+
+[modules.txn]
+fr_timer = "1s"

@@ -1,0 +1,38 @@
+// Digest authentication: 401 for REGISTER, 407 for the rest; the
+// authenticated user must be the To user (REGISTER) or the From user.
+import auth, location, route_set
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    // In-dialog requests follow the Record-Route set up by the INVITE.
+    if msg.has_to_tag {
+        if route_set.follow() {
+            relay(msg)
+        }
+        // The ACK of a negative reply sent here (401, 407, 403).
+        if msg.method == ACK {
+            drop
+        }
+        reply(NotFound, "Not here")
+    }
+    // CANCEL can't be challenged (RFC 3261 §22.1): it follows its INVITE.
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    if !auth.check(features.realm, "subscriber", 1) {
+        // -8: valid credentials of another user. A 403, not a new
+        // challenge. .fsr checks give a Bool, so the code comes from $rc.
+        if pv("$rc") == -8 {
+            reply(Forbidden, "User mismatch")
+        }
+        auth.challenge(features.realm, 1)
+    }
+    auth.consume_credentials()
+    if msg.method == REGISTER {
+        location.save()
+    }
+    route_set.record()
+    msg.dst_uri = features.upstream
+    relay(msg)
+}

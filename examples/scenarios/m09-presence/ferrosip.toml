@@ -1,0 +1,37 @@
+# m09-presence: the proxy is the presence server of example.com (PUBLISH,
+# SUBSCRIBE/NOTIFY for presence and dialog), a resource list server, and
+# publishes the dialog state of the calls it routes.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m09.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+domain = "example.com"
+trusted = "${TRUSTED:-127.0.0.0/8}"
+callee = "${CALLEE:-sip:127.0.0.1:5080}"   # where calls go (one phone: bob)
+
+[modules.presence]
+max_expires = "30m"               # PUBLISH: longer requests are cut to this
+max_expires_subscribe = "10m"
+min_expires = "10s"               # shorter SUBSCRIBEs get 423
+
+[modules.presence_xml]            # the presence event package (PIDF)
+force_dummy_presence = true       # no publication: one closed tuple
+
+[modules.presence_dialoginfo]     # the dialog event package
+force_dummy_dialog = true         # no publication: an empty dialog-info
+
+[modules.pua_dialoginfo]          # publish the state of the calls we route…
+presence_server = "sip:127.0.0.1:${SIP_PORT:-5060}"   # …to ourselves
+caller_trying = false             # the caller from the first provisional on
+
+[modules.resource_lists]          # rls: the lists are rls-services documents
+db_url = "${RLS_DB:-text://db}"   # in the xcap table (db/xcap)
+
+[routing]
+entry = "routes/main.fsr"

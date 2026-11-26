@@ -1,0 +1,25 @@
+# s05-acl-allowlist: only the SIP trunks may send. Two layers: the trunk
+# IPs ([feature] trunk_a / trunk_b, checked in the routing) and the exact
+# trunk addresses, ip and port (the acl module's address table, group 1).
+# Everything that passes goes to the PBX; the rest gets 403.
+#
+#   ferrosip --config examples/scenarios/s05-acl-allowlist/ferrosip.toml
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-s05.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+pbx = "${PBX:-sip:127.0.0.1:5080}"
+trunk_a = "${TRUNK_A:-127.0.0.1}"   # the carriers' signalling IPs ([feature]
+trunk_b = "${TRUNK_B:-192.0.2.10}"  # values are scalars: no lists)
+
+[modules.acl]                    # permissions
+db_url = "text://${ACL_DB:-db}"  # db/address: group 1 = trunks (ip, mask, port; port 0 = any)
+
+[routing]
+entry = "routes/main.fsr"

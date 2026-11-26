@@ -1,0 +1,62 @@
+// Registrar and proxy with the subscribers' credentials in Redis
+// (HGET subscriber:<user> ha1), cached in a shared table.
+import auth, location, redis, route_set
+import { features } from config
+
+// HA1s read from Redis, for every worker: Redis is asked once per user
+// and ttl, and when a cached HA1 doesn't match (the password changed).
+shared table ha1_cache: Map<Str, Str> ttl 10m
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    if msg.has_to_tag {
+        guard route_set.follow() else reply(NotFound, "Not here")
+        relay(msg)
+    }
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    guard msg.method == REGISTER || msg.method == INVITE else reply(MethodNotAllowed)
+    guard auth.has_credentials(features.realm) else auth.challenge(features.realm)
+    // The credentials' user ($au) is the subscriber: it names the Redis
+    // key, so it is checked first, and it must be the From user.
+    let user = "{pv("$au")}"
+    guard user =~ "^[a-z0-9._-]\{1,32\}$" else reply(Forbidden, "Bad user name")
+    guard user == msg.from.user else reply(Forbidden, "Credentials of another user")
+    if !(ha1_cache.contains(user) && auth.pv_check(features.realm, ha1_cache.get(user), 1, 1)) {
+        // Not cached, or the cached HA1 no longer matches: ask Redis.
+        guard redis.exec_with("creds", "HGET %s ha1", "subscriber:{user}", "r") else reply(ServiceUnavailable, "Credential store unavailable")
+        let ha1 = "{pv("$redis(r=>value)")}"
+        redis.free("r")
+        // An unknown user is challenged again, like a wrong password.
+        guard ha1 =~ "^[0-9a-f]\{32\}$" else auth.challenge(features.realm)
+        guard auth.pv_check(features.realm, ha1, 1, 1) else auth.challenge(features.realm)
+        ha1_cache.set(user, ha1)
+    }
+    let realm = pv("$ar")
+    auth.consume_credentials()
+    if msg.method == REGISTER {
+        // One phone per user: a new registration replaces the others.
+        location.save(4)
+    }
+    route_set.record()
+    guard location.lookup() else reply(NotFound, "Not registered")
+    msg.headers["X-Authenticated-User"] = "{user}@{realm}"
+    relay(msg)
+}
+
+// GET /phone?<user>: the user's registered phone (fetch_contacts, $ulc).
+on http(req: HttpRequest) where req.path == "/phone" && req.method == "GET" {
+    guard req.query =~ "^[a-z0-9._-]\{1,32\}$" else req.reply(400, "not a user name\n")
+    guard location.fetch_contacts("sip:{req.query}@{features.realm}", "p") else req.reply(404, "not registered\n")
+    let count = pv("$ulc(p=>count)")
+    let contact = pv("$ulc(p=>addr)")
+    let received = pv("$ulc(p=>received)")
+    let agent = pv("$ulc(p=>user_agent)")
+    location.free_contacts("p")
+    req.reply(200, """count={count}
+contact={contact}
+received={received}
+user_agent={agent}
+""")
+}

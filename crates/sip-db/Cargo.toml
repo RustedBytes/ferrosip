@@ -1,0 +1,29 @@
+[package]
+name = "sip-db"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.43", features = ["bundled"], optional = true }
+mysql = { version = "28", default-features = false, features = ["minimal-rust", "rustls-tls-ring"], optional = true }
+postgres = { version = "0.19", optional = true }
+bytes = { version = "1", optional = true }
+postgres_rustls = { version = "0.1", features = ["runtime"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+rustls = { workspace = true, optional = true }
+
+[features]
+default = ["sqlite"]
+# SQLite (bundled C library): sqlite:// URLs and raw SQL (sqlops).
+sqlite = ["dep:rusqlite"]
+# MySQL / MariaDB: mysql:// URLs.
+mysql = ["dep:mysql"]
+# PostgreSQL: postgres:// URLs (pulls in tokio via the postgres crate).
+postgres = ["dep:postgres", "dep:bytes", "dep:postgres_rustls", "dep:tokio-rustls", "dep:rustls"]
+
+[lints]
+workspace = true

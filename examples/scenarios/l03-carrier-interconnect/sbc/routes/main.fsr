@@ -1,0 +1,71 @@
+// SBC between customers and two carriers.
+import auth, sip, text, dialog, pipe_limits, http_client
+import { features } from config
+
+dialog var customer: Str
+dialog var number: Str
+dialog var carrier: Str
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    if msg.has_to_tag {
+        // In-dialog: topology hiding has turned the masked R-URI back into
+        // the real contact.
+        relay(msg)
+    }
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    if msg.method == OPTIONS && sip.options_reply() {
+        exit
+    }
+    guard auth.check(features.realm) else auth.challenge(features.realm)
+    auth.consume_credentials()
+    guard msg.method == INVITE else reply(MethodNotAllowed)
+    let who = msg.from.user
+    guard pipe_limits.check_or_create("cust-{who}", "TAILDROP", features.calls_per_window) else pipe_limits.reject(5s)
+    guard normalise(msg) else reply(AddressIncomplete)
+    dialog.manage()
+    dialog.customer = who
+    dialog.number = msg.ruri.user
+    to_carriers(msg)
+}
+
+// 0049301234 / 0301234 / +49301234 → +49301234; anything else that isn't
+// E.164 by then is refused.
+fn normalise(msg: Request) -> Bool {
+    if msg.ruri.user =~ "^00[1-9]" {
+        text.subst_user("/^00/+/")
+    } else if msg.ruri.user =~ "^0[1-9]" {
+        text.subst_user("/^0/+{features.country_code}/")
+    }
+    return sip.is_e164(msg.ruri.user)
+}
+
+fn to_carriers(msg: Request) -> Action {
+    // Up to 30s of ringing, but a carrier that sends nothing at all (not
+    // even 100 Trying) is down after fr_timer (1s).
+    txn.set_timeout(30s, 1s)
+    for gw in [features.carrier1, features.carrier2] {
+        msg.dst_uri = gw
+        dialog.carrier = gw
+        let res = await txn.relay(msg)
+        match res {
+            // Answered, busy, rejected, canceled, or a 6xx: the outcome.
+            Final(r) if r.code < 500 || r.code >= 600 => forward(r)
+            // 5xx or no answer: the next carrier.
+            _ => {}
+        }
+    }
+    reply(ServiceUnavailable, "No carrier available")
+}
+
+on dialog.ended(d: Dialog) {
+    let out = ""
+    http_client.post(features.cdr_url, "event=end&call_id={d.call_id}&customer={d.customer}&number={d.number}&carrier={d.carrier}&duration={d.duration}&reason={d.end_reason}", out)
+}
+
+on dialog.failed(d: Dialog) {
+    let out = ""
+    http_client.post(features.cdr_url, "event=failed&call_id={d.call_id}&customer={d.customer}&number={d.number}&carrier={d.carrier}&code={d.code}", out)
+}

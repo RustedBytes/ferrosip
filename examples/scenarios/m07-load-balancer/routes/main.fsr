@@ -1,0 +1,64 @@
+// Load balancer: round-robin over set 1, failover to the next server.
+import balancer, ip, route_set
+import { features } from config
+
+// The state each destination was last reported in, and how often it
+// went down / up (keys "down:<uri>", "up:<uri>"); served by `on http`.
+shared table ds_state: Map<Str, Str>
+shared table ds_events: Map<Str, Counter>
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    // Only the front-end proxies (trusted) use the balancer.
+    guard ip.in_subnet(msg.src.ip, features.trusted) else reply(Forbidden, "Not trusted")
+    if msg.has_to_tag {
+        guard route_set.follow() else reply(NotFound, "Not here")
+        relay(msg)
+    }
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    if msg.method != INVITE {
+        reply(MethodNotAllowed)
+    }
+    // Round robin (4) over the active destinations of set 1.
+    guard balancer.select(1, 4) else reply(ServiceUnavailable, "No server available")
+    route_set.record()
+    to_pool(msg)
+}
+
+fn to_pool(msg: Request) -> Action {
+    while true {
+        let res = await txn.relay(msg)
+        match res {
+            // Answered or refused by the server: that's the outcome.
+            Final(r) if r.code < 500 || r.code >= 600 => forward(r)
+            // No answer at all: the server is gone. Mark it inactive (and
+            // probing: the probes bring it back) and try the next one.
+            Timeout => balancer.mark("ip")
+            // 5xx: alive but unable; just try the next one.
+            _ => {}
+        }
+        if !balancer.next() {
+            break
+        }
+    }
+    reply(ServiceUnavailable, "All servers failed")
+}
+
+on balancer.down(e: Destination) {
+    log.warn("balancer: {e.uri} is down\n")
+    ds_state.set(e.uri, "down")
+    ds_events.incr("down:{e.uri}")
+}
+
+on balancer.up(e: Destination) {
+    log.info("balancer: {e.uri} is up\n")
+    ds_state.set(e.uri, "up")
+    ds_events.incr("up:{e.uri}")
+}
+
+// GET /balancer?<uri>: "<state> down=<n> up=<n>".
+on http(req: HttpRequest) where req.path == "/balancer" {
+    req.reply(200, "{ds_state.get(req.query)} down={ds_events.get("down:{req.query}")} up={ds_events.get("up:{req.query}")}")
+}

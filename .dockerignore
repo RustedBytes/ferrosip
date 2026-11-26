@@ -1,0 +1,15 @@
+# Only what `cargo build -p ferrosip -p ferroctl` and the image need.
+.git
+.github
+target
+fuzz
+bench
+docs
+tests
+**/*.pem
+**/__pycache__
+Dockerfile
+docker-compose.yml
+examples
+**/node_modules
+crates/mod-webui/ui/dist

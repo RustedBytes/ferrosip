@@ -1,0 +1,14 @@
+# Production overlay: merged over ferrosip.toml (tables merge, values replace).
+[core]
+workers = 16
+log_level = "notice"
+
+[feature]
+nat = true
+
+[modules.txn]
+fr_inv_timer = "90s"
+
+[modules.location]
+db_mode = "write-back"
+db_url = "${DB_URL:-sqlite:///var/lib/ferrosip/location.db}"

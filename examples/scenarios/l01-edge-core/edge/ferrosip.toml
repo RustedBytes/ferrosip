@@ -1,0 +1,17 @@
+# l01-edge-core / edge: the proxy phones talk to. Flood protection,
+# Path for registrations, Record-Route; everything goes on to the core.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-l01-edge.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${EDGE_PORT:-5060}"
+
+[feature]
+core = "${CORE:-sip:127.0.0.1:5070}"
+flood_limit = 20          # requests per source address and second
+
+[routing]
+entry = "routes/main.fsr"

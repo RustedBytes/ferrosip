@@ -1,0 +1,15 @@
+[package]
+name = "mod-media"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+version.workspace = true
+
+[dependencies]
+sip-parser.workspace = true
+sip-core.workspace = true
+
+[lints]
+workspace = true

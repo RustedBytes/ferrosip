@@ -1,0 +1,35 @@
+// PSTN gateway failover: try each gateway in turn.
+import ip, route_set
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    if msg.has_to_tag {
+        guard route_set.follow() else reply(NotFound, "Not here")
+        relay(msg)
+    }
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    guard ip.in_subnet(msg.src.ip, features.trusted) else reply(Forbidden, "Not trusted")
+    if msg.method != INVITE {
+        reply(MethodNotAllowed)
+    }
+    route_set.record()
+    to_gateways(msg)
+}
+
+fn to_gateways(msg: Request) -> Action {
+    for gw in [features.gw1, features.gw2, features.gw3] {
+        msg.dst_uri = gw
+        let res = await txn.relay(msg, timeout: 3s)
+        match res {
+            // Answered, busy, rejected, canceled, or a 6xx (global: don't
+            // try elsewhere, RFC 3261 §16.7): that's the outcome.
+            Final(r) if r.code < 500 || r.code >= 600 => forward(r)
+            // 5xx or no answer: the next gateway.
+            _ => {}
+        }
+    }
+    reply(ServiceUnavailable, "All gateways failed")
+}

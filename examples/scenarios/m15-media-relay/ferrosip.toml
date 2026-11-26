@@ -1,0 +1,25 @@
+# m15-media-relay: every call's media goes through a media relay that
+# speaks rtpengine's ng protocol (rtpengine, or rtpflux as in the test).
+# Offers and answers are rewritten to the relay; hold/resume re-INVITEs go
+# through it too; BYE, CANCEL and failed calls delete the session.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m15.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+trusted = "${TRUSTED:-127.0.0.0/8}"
+# The ng options for offer and answer: the relay replaces the SDP's
+# origin and session c= lines, and ICE is taken out of the SDP both ways.
+media_flags = "replace-origin replace-session-connection ICE=remove"
+
+[modules.media]
+rtpengine_sock = "${MEDIA_RELAY:-udp:127.0.0.1:2223}"
+rtpengine_retr = 2
+
+[routing]
+entry = "routes/main.fsr"

@@ -1,0 +1,20 @@
+# s06-message-edits: header, body and R-URI edits on the way to one
+# upstream, and header edits on the replies coming back.
+#
+#   ferrosip --config examples/scenarios/s06-message-edits/ferrosip.toml
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-s06.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+upstream = "${UPSTREAM:-sip:127.0.0.1:5080}"
+trusted = "${TRUSTED:-127.0.0.0/8}"
+media_ip = "203.0.113.200"     # the address SDP c= lines are rewritten to
+
+[routing]
+entry = "routes/main.fsr"

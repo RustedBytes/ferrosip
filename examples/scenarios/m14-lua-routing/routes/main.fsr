@@ -1,0 +1,31 @@
+// Routing in Lua: the .fsr guards the request and relays; Lua decides.
+import lua, ip, route_set
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    guard ip.in_subnet(msg.src.ip, features.trusted) else reply(Forbidden, "Not trusted")
+    if msg.has_to_tag {
+        guard route_set.follow() else reply(NotFound, "Not here")
+        relay(msg)
+    }
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    if msg.method != INVITE {
+        reply(MethodNotAllowed)
+    }
+    // Each tenant has its own Lua function, route_<tenant>. Only letters:
+    // a header must not be able to name any other Lua global.
+    let tenant = "default"
+    if msg.headers.has("X-Tenant") {
+        tenant = msg.headers["X-Tenant"]
+    }
+    guard tenant =~ "^[a-z]+$" else reply(BadRequest, "Bad tenant")
+    route_set.record()
+    // Lua sets $du and headers, or answers itself (KSR.sl.sl_send_reply +
+    // KSR.x.exit(), which ends this route too). A Lua error, a missing
+    // function or a false return: 500.
+    guard lua.run("route_{tenant}", msg.from.display) else reply(ServerInternalError, "Lua routing failed")
+    relay(msg)
+}

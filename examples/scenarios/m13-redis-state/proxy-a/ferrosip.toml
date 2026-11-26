@@ -1,0 +1,24 @@
+# m13-redis-state / proxy-a: one of two proxies sharing a per-user block
+# list and a per-caller call counter in Redis (Kamailio ndb_redis).
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m13-a.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+name = "proxy-a"                                 # added to relayed INVITEs as X-Served-By
+callee = "${CALLEE:-sip:127.0.0.1:5080}"         # the PBX behind both proxies
+trusted = "${TRUSTED:-127.0.0.0/8}"
+call_limit = 3                                   # calls per caller and window
+call_window = 30                                 # seconds (the counter key's expiry)
+block_ttl = 600                                  # default seconds a block lasts
+
+[modules.redis]          # ndb_redis: one connection per server, reconnected on failure
+server = ["name=state;addr=127.0.0.1;port=${REDIS_PORT:-6379};db=0"]
+
+[routing]
+entry = "routes/main.fsr"

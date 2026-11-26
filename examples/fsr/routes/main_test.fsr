@@ -1,0 +1,45 @@
+// Tests of main.fsr: ferrosip test --config examples/fsr/ferrosip.toml examples/fsr/routes/main_test.fsr
+// They run in-process: real modules, no sockets, no database. send() hands
+// a message to the routing; answer() replies to what it relayed.
+
+test "OPTIONS is answered" {
+    send("OPTIONS sip:proxy@127.0.0.1")
+    assert(reply_code() == OK)
+}
+
+test "an unknown user gets 404" {
+    location.lookup = false
+    send("INVITE sip:nobody@example.com")
+    assert(reply_code() == NotFound)
+    assert(relays() == 0)
+}
+
+test "busy goes to voicemail" {
+    location.lookup = true
+    send("INVITE sip:bob@10.0.0.5:5060")
+    assert(relay_uri() == "sip:bob@10.0.0.5:5060")
+    answer(BusyHere)
+    assert(relay_uri(2) == "sip:vm@127.0.0.1:5090")
+    answer(OK)
+    assert(reply_code() == OK)
+}
+
+test "numbers go to the gateways, the second when the first fails" {
+    send("INVITE sip:+15551234567@127.0.0.1")
+    assert(relay_dest() == "10.0.0.10:5060")
+    answer(ServiceUnavailable)
+    assert(relay_dest(2) == "10.0.0.11:5060")
+    answer(OK)
+    assert(reply_code() == OK)
+}
+
+test "a REGISTER flood bans the source" {
+    location.save = true
+    for i in 1..21 {
+        send("REGISTER sip:example.com", from: "10.9.9.9:5060")
+    }
+    assert(bans.contains("10.9.9.9"))
+    assert(calls(location.save) == 20)
+    send("OPTIONS sip:proxy@127.0.0.1", from: "10.9.9.9:5060")
+    assert(reply_code() == 0)
+}

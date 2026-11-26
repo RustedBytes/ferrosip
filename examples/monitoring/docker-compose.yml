@@ -1,0 +1,57 @@
+# ferrosip + Prometheus + Grafana, with the ferrosip dashboard provisioned.
+#
+#   cd examples/monitoring
+#   docker compose up -d --build
+#   python3 smoke.py              # SIP traffic, then check every dashboard query has data
+#   open http://127.0.0.1:3000    # Grafana: the "ferrosip" dashboard (anonymous viewer; admin / admin)
+#
+# Everything uses the host network (SIP needs real addresses; see the main
+# docker-compose.yml) and listens on 127.0.0.1 only:
+# - ferrosip: SIP on 5060, metrics on 9095;
+# - Prometheus: 9090;
+# - Grafana: 3000.
+
+services:
+  ferrosip:
+    build: ../..
+    image: ferrosip:latest
+    network_mode: host
+    init: true
+    restart: unless-stopped
+    command: ["-f", "/etc/ferrosip/ferrosip.cfg", "-l", "udp:127.0.0.1:5060", "-l", "tcp:127.0.0.1:5060",
+              "--rpc-socket", "/run/ferrosip/rpc.sock"]
+    volumes:
+      - ./ferrosip.cfg:/etc/ferrosip/ferrosip.cfg:ro
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.listen-address=127.0.0.1:9090
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SECURITY_ADMIN_PASSWORD: admin          # change it outside a test setup
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/ferrosip.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+volumes:
+  prometheus-data:

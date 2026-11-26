@@ -1,0 +1,33 @@
+# s08-feature-overlays: one routing, two environments. This file holds the
+# safe defaults (authentication on, no debug headers); envs/dev.toml and
+# envs/prod.toml are merged over it.
+#
+#   ferrosip --config ferrosip.toml --overlay envs/dev.toml
+#   ferrosip --config ferrosip.toml --overlay envs/prod.toml
+#   ferrosip check --config ferrosip.toml --overlay envs/prod.toml --explain
+
+[core]
+workers = 2
+log_level = "warn"
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-s08.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+env_name = "base"
+upstream = "${UPSTREAM:-sip:127.0.0.1:5080}"
+trusted = "${TRUSTED:-127.0.0.0/8}"
+realm = "example.com"
+require_auth = true      # digest auth (407) before relaying
+debug_headers = false    # X-Debug on relayed requests
+
+[modules.auth]
+users_file = "users"
+
+[modules.txn]
+fr_timer = "2s"
+
+[routing]
+entry = "routes/main.fsr"

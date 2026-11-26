@@ -1,0 +1,23 @@
+# m02-gateway-failover: calls go to three PSTN gateways in turn; a 5xx or
+# no answer moves on to the next one, any other final ends the call.
+
+[core]
+workers = 2
+rpc_socket = "${RPC_SOCK:-/tmp/ferrosip-m02.sock}"
+
+[[listen]]
+proto = "udp"
+addr = "127.0.0.1:${SIP_PORT:-5060}"
+
+[feature]
+gw1 = "${GW1:-sip:127.0.0.1:5071}"
+gw2 = "${GW2:-sip:127.0.0.1:5072}"
+gw3 = "${GW3:-sip:127.0.0.1:5073}"
+trusted = "${TRUSTED:-127.0.0.0/8}"
+
+[modules.txn]
+fr_timer = "1s"          # non-INVITE requests; the INVITE's await sets its own timeout
+fr_inv_timer = "30s"
+
+[routing]
+entry = "routes/main.fsr"

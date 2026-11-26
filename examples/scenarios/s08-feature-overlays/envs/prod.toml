@@ -1,0 +1,13 @@
+# Production: the base's authentication, quieter logs, a longer timer.
+# Merged over ../ferrosip.toml (tables merge, values replace).
+
+[core]
+workers = 4
+log_level = "notice"
+
+[feature]
+env_name = "prod"
+upstream = "${PROD_UPSTREAM:-sip:127.0.0.1:5090}"
+
+[modules.txn]
+fr_timer = "3s"

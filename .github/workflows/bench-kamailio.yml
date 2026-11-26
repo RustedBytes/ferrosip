@@ -1,0 +1,47 @@
+name: Benchmark vs Kamailio
+
+# Manual only: Kamailio (built from its GitHub sources at a release tag)
+# and ferrosip on the same runner, same CPU pinning and load
+# (bench/kamailio/build.sh, bench/kamailio/run.sh).
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: Alternating runs per scenario
+        default: "5"
+      kamailio_version:
+        description: Kamailio release tag to build
+        default: "6.1.5"
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.100
+      - uses: Swatinem/rust-cache@v2
+      - name: Kamailio build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bison flex
+      - uses: actions/cache@v6
+        with:
+          path: target/kamailio-${{ inputs.kamailio_version }}
+          key: kamailio-${{ inputs.kamailio_version }}-${{ runner.os }}-${{ hashFiles('bench/kamailio/build.sh') }}
+      - name: Build Kamailio ${{ inputs.kamailio_version }} from GitHub
+        run: echo "KAMAILIO_PREFIX=$(KAMAILIO_VERSION=${{ inputs.kamailio_version }} bench/kamailio/build.sh)" >> "$GITHUB_ENV"
+      - run: cargo build --release -p ferrosip -p sipflood -p ferroctl
+      - run: nproc && lscpu | grep -E "Model name|^CPU\(s\)"
+      - name: Run
+        shell: bash
+        run: |
+          ROUNDS=${{ inputs.rounds }} bench/kamailio/run.sh | tee bench.log
+          {
+            echo "## ferrosip vs Kamailio ($("$KAMAILIO_PREFIX/sbin/kamailio" -v | head -1 | cut -d' ' -f2-3), $(nproc) vCPU)"
+            echo
+            sed -n '/^| scenario/,$p' bench.log
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-kamailio
+          path: target/bench-kamailio/

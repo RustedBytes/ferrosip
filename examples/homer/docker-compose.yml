@@ -1,0 +1,88 @@
+# ferrosip + HOMER 7 (heplify-server, homer-app, TimescaleDB).
+#
+#   cd examples/homer
+#   docker compose up -d --build
+#   python3 smoke.py              # a REGISTER and a call through ferrosip, then check HOMER has them
+#   open http://localhost:9080    # HOMER, login admin / sipcapture
+#
+# ferrosip sends HEPv3 (siptrace, ferrosip.cfg) to heplify-server, which
+# stores it in the database; homer-app is the web UI to search it. The
+# HOMER services are sipcapture/homer7-docker's heplify-server/
+# hom7-timescaledb-all without Grafana, Prometheus, Loki and Telegraf.
+# Their images aren't pinned upstream either: pin them for production.
+
+services:
+  ferrosip:
+    build: ../..
+    image: ferrosip:latest
+    # SIP needs real addresses (see the main docker-compose.yml); HEP goes to
+    # heplify-server's port published on the host.
+    network_mode: host
+    init: true
+    restart: unless-stopped
+    command: ["-f", "/etc/ferrosip/ferrosip.cfg", "-l", "udp:0.0.0.0:5060", "-l", "tcp:0.0.0.0:5060",
+              "--rpc-socket", "/run/ferrosip/rpc.sock"]
+    volumes:
+      - ./ferrosip.cfg:/etc/ferrosip/ferrosip.cfg:ro
+    depends_on:
+      - heplify-server
+
+  heplify-server:
+    image: sipcapture/heplify-server:latest
+    command: ./heplify-server
+    restart: unless-stopped
+    environment:
+      - HEPLIFYSERVER_HEPADDR=0.0.0.0:9060
+      - HEPLIFYSERVER_HEPTCPADDR=0.0.0.0:9061
+      - HEPLIFYSERVER_DBSHEMA=homer7
+      - HEPLIFYSERVER_DBDRIVER=postgres
+      - HEPLIFYSERVER_DBADDR=db:5432
+      - HEPLIFYSERVER_DBUSER=root
+      - HEPLIFYSERVER_DBPASS=homerSeven
+      - HEPLIFYSERVER_DBDATATABLE=homer_data
+      - HEPLIFYSERVER_DBCONFTABLE=homer_config
+      - HEPLIFYSERVER_DBROTATE=true
+      - HEPLIFYSERVER_DBDROPDAYS=5
+      - HEPLIFYSERVER_LOGLVL=info
+      - HEPLIFYSERVER_LOGSTD=true
+      - HEPLIFYSERVER_DEDUP=false
+    ports:
+      - "9060:9060/udp"   # HEP over UDP (ferrosip's duplicate_uri)
+      - "9061:9061/tcp"   # HEP over TCP (other agents)
+    depends_on:
+      db:
+        condition: service_healthy
+
+  homer-webapp:
+    image: ghcr.io/sipcapture/homer-app:latest
+    restart: unless-stopped
+    environment:
+      - DB_HOST=db
+      - DB_USER=root
+      - DB_PASS=homerSeven
+      - DB_KEEPALIVE=false
+      - PRESET=timescale
+      - HOMER_LOGLEVEL=info
+    ports:
+      - "9080:80"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: homerSeven   # change it outside a test setup
+    volumes:
+      - ./init-user-db.sh:/docker-entrypoint-initdb.d/init-user-db.sh:ro
+      - homer-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "psql -h localhost -U root -c '\\l'"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  homer-db:

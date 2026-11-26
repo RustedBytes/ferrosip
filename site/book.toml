@@ -1,0 +1,29 @@
+# The documentation site. site/build.py stages the repository's Markdown
+# into site/src (same paths, so the links written for GitHub keep working),
+# then: mdbook build site. Published to GitHub Pages by
+# .github/workflows/docs.yml.
+
+[book]
+title = "ferrosip"
+description = "A Kamailio-compatible SIP proxy and registrar in Rust"
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+# The default `index` preprocessor turns README.md into index.html, which
+# would break every link to a …/README.md. No page uses {{#include}}, so
+# the `links` preprocessor isn't needed either.
+use-default-preprocessors = false
+
+[output.html]
+git-repository-url = "https://github.com/RustedBytes/ferrosip"
+edit-url-template = "https://github.com/RustedBytes/ferrosip/edit/main/{path}"
+site-url = "/ferrosip/"
+default-theme = "light"
+preferred-dark-theme = "navy"
+
+[output.html.search]
+enable = true
+limit-results = 30

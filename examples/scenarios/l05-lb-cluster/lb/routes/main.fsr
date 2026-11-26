@@ -1,0 +1,42 @@
+// Load balancer: round robin over set 1, fail over on no answer / 5xx.
+import ip, sip, route_set, balancer
+import { features } from config
+
+route main(msg: Request) {
+    guard msg.max_forwards > 0 else reply(TooManyHops)
+    guard ip.in_subnet(msg.src.ip, features.trusted) else reply(Forbidden, "Not trusted")
+    if msg.has_to_tag {
+        // In-dialog: back through the app proxy that took the call (no
+        // failover: it holds the dialog).
+        guard route_set.follow() else reply(NotFound, "Not here")
+        relay(msg)
+    }
+    if msg.method == CANCEL {
+        relay(msg)
+    }
+    if msg.method == OPTIONS && sip.options_reply() {
+        exit
+    }
+    route_set.record()
+    guard balancer.select(1, 4) else reply(ServiceUnavailable, "No app server")
+    while true {
+        let res = await txn.relay(msg)
+        match res {
+            Final(r) if r.code < 500 && r.code != RequestTimeout => forward(r)
+            _ => {}
+        }
+        balancer.mark("ip")
+        if !balancer.next() {
+            break
+        }
+    }
+    reply(ServiceUnavailable, "No app server answered")
+}
+
+on balancer.down(e: Destination) {
+    log.warn("app server {e.uri} is down\n")
+}
+
+on balancer.up(e: Destination) {
+    log.info("app server {e.uri} is up\n")
+}
