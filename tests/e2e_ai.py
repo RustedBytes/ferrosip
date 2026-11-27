@@ -493,6 +493,13 @@ try:
     check("CANCEL while connecting: 487 for the INVITE (without waiting out the connect)", r487 is not None)
     if r487:
         request("ACK", "cancel-1", 1, to_tag=hdr(r487, "To").split("tag=")[1])
+    # The 487 comes from the SIP stack at once; the call's own thread
+    # notices the CANCEL a moment later. Let it finish before the next call,
+    # so "newest first" below compares calls that ended in a known order.
+    for _ in range(40):
+        if any(c.get("call_id") == "cancel-1" for c in json.loads(ferroctl("ai.recent") or "[]")):
+            break
+        time.sleep(0.05)
 
     mock.refuse_next = True
     invite("refused-1", "openai", "x", next(RTP_PORTS))

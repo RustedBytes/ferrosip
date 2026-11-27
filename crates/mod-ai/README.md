@@ -92,6 +92,14 @@ first in `request_route` (`route main`). It returns -1 for anything else.
   address for the same stream.
 - It handles OPTIONS/INFO/UPDATE.
 
+The SIP side of every AI call runs on the shared UA engine
+([`sip-ua`](../sip-ua/README.md)): the INVITE server transaction, 100
+Trying, the 200 OK retransmitted until the ACK (BYE after 32 s without
+one), CANCEL/487, BYE in both directions, re-INVITE and session timers a
+caller asks for. Callers that resend their INVITE, or send their CANCEL,
+with a new Via branch are still matched, by Call-ID, From tag, CSeq and
+Via sent-by (`lenient_matching`). The module no longer needs `tm`.
+
 ## The call
 
 - **Media:**

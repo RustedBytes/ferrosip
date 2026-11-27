@@ -2,7 +2,6 @@
 //! Gemini Live, with the system prompt taken from the call (a header).
 //!
 //! ```text
-//! loadmodule "tm"
 //! loadmodule "ai"
 //! modparam("ai", "media_ip", "203.0.113.10")      # address for RTP in SDP
 //! # keys: OPENAI_API_KEY / GEMINI_API_KEY from the environment, or:
@@ -21,19 +20,20 @@
 //! ferrosip is the far end of the call: it answers the INVITE (G.711
 //! PCMU/PCMA, 20 ms), runs the RTP itself, and bridges the audio to the
 //! provider's WebSocket. The model can end the call (an `end_call`
-//! function); either side's hang-up ends both. See README.md.
+//! function); either side's hang-up ends both. The SIP dialog runs on the
+//! shared UA engine (`sip-ua`, see `ua.rs`). See README.md.
 
 mod audio;
 mod call;
 mod provider;
 mod rtp;
 mod sdp;
+mod ua;
 mod wsc;
 
 use call::{Call, Ev, Phase, St};
-use mod_txn::Tm;
 use provider::Kind;
-use sip_core::module::{DynStr, ReplyExtra};
+use sip_core::module::DynStr;
 use sip_core::schema::{ParamSpec, Ty, UINT, Unit, p};
 use sip_core::sig::{FnSig, Param};
 use sip_core::sync::lock;
@@ -66,8 +66,9 @@ pub struct Config {
 
 pub struct Inner {
     pub cfg: Config,
-    pub tm: Arc<Tm>,
     pub net: OnceLock<Arc<dyn Outbound>>,
+    /// The SIP side of every AI call (`sip-ua`), set when workers start.
+    ua: OnceLock<ua::Ua>,
     calls: Mutex<HashMap<String, Arc<Call>>>,
     /// Calls not yet over (Done ones linger in `calls` for a while).
     pub active: AtomicUsize,
@@ -80,6 +81,14 @@ pub struct Inner {
 }
 
 impl Inner {
+    /// Run a command on the UA engine.
+    pub fn ua_command(&self, cmd: sip_ua::UaCommand) -> Result<(), sip_ua::CommandError> {
+        match self.ua.get() {
+            Some(u) => u.command(cmd),
+            None => Err(sip_ua::CommandError::InvalidState("ai: not started")),
+        }
+    }
+
     pub fn remember(&self, summary: serde_json::Value) {
         self.recent.push(summary);
     }
@@ -201,13 +210,12 @@ impl Module for Ai {
     }
 
     fn register(self: Arc<Self>, reg: &mut Registry) -> Result<(), String> {
-        let tm = reg.api::<Tm>().ok_or("ai needs tm: put loadmodule \"tm\" before \"ai\"")?;
         let cfg = config(&lock(&self.params).0)?;
         let inner = Arc::new(Inner {
             next_slot: AtomicUsize::new(0),
             cfg,
-            tm,
             net: OnceLock::new(),
+            ua: OnceLock::new(),
             calls: Mutex::new(HashMap::new()),
             active: AtomicUsize::new(0),
             total: AtomicU64::new(0),
@@ -264,7 +272,21 @@ impl Module for Ai {
 
     fn spawn(self: Arc<Self>, net: Arc<dyn Outbound>) -> Result<(), String> {
         let Some(inner) = self.inner.get().cloned() else { return Ok(()) };
+        let _ = inner.ua.set(ua::Ua::new(net.clone()));
         let _ = inner.net.set(net);
+        // The UA engine's timers (retransmissions, ACK wait, transaction ends).
+        let i = inner.clone();
+        std::thread::Builder::new()
+            .name("ai-ua".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_millis(10));
+                    if let Some(u) = i.ua.get() {
+                        u.tick();
+                    }
+                }
+            })
+            .map_err(|e| format!("cannot start the ai-ua thread: {e}"))?;
         // Forget finished calls once their retransmissions are over.
         std::thread::Builder::new()
             .name("ai-reaper".into())
@@ -355,26 +377,20 @@ pub fn uri_of(v: &str) -> String {
     }
 }
 
-/// Split a header value at commas outside quotes and `<…>`.
-fn split_values(v: &str) -> Vec<String> {
-    let (mut out, mut cur, mut depth, mut quoted) = (Vec::new(), String::new(), 0i32, false);
-    for c in v.chars() {
-        match c {
-            '"' => quoted = !quoted,
-            '<' if !quoted => depth = depth.saturating_add(1),
-            '>' if !quoted => depth = depth.saturating_sub(1),
-            ',' if !quoted && depth == 0 => {
-                out.push(std::mem::take(&mut cur).trim().to_string());
-                continue;
-            }
-            _ => {}
+/// A call registered by another worker whose INVITE is still being handed
+/// to the engine: wait (microseconds in practice) until it has a leg, or
+/// is gone because the engine refused the INVITE.
+fn settled(inner: &Inner, c: &Call, callid: &str) -> bool {
+    for _ in 0..200 {
+        if c.leg.get().is_some() {
+            return true;
         }
-        cur.push(c);
+        if !lock(&inner.calls).contains_key(callid) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
-    if !cur.trim().is_empty() {
-        out.push(cur.trim().to_string());
-    }
-    out
+    c.leg.get().is_some()
 }
 
 fn text(b: &[u8]) -> String {
@@ -424,9 +440,14 @@ fn answer(inner: &Arc<Inner>, ctx: &mut Ctx<'_, '_>, provider: &str, prompt: &st
     if has_tag(&to_hdr) {
         return -1; // re-INVITE: ai_dialog()'s business
     }
-    // A retransmission of an INVITE we're already handling.
+    // A retransmission of an INVITE we're already handling: its
+    // transaction in the engine answers it again.
     if let Some(c) = lock(&inner.calls).get(&callid).cloned() {
-        resend(ctx, &c);
+        if settled(inner, &c, &callid)
+            && let Some(u) = inner.ua.get()
+        {
+            u.input(ctx.msg.buf, ctx.src, None);
+        }
         return 1;
     }
     let Some(kind) = Kind::parse(provider) else {
@@ -485,12 +506,10 @@ fn answer(inner: &Arc<Inner>, ctx: &mut Ctx<'_, '_>, provider: &str, prompt: &st
         let _ = ctx.reply_with(400, "Bad Request", &warn("missing Contact"));
         return -1;
     }
-    let buf = ctx.msg.buf;
-    let rr: Vec<_> =
-        ctx.msg.headers.iter().filter(|h| h.kind == HdrKind::RecordRoute).filter_map(|h| Some((text(h.body), buf.get(h.start..h.end)?.to_vec()))).collect();
-    let routes: Vec<String> = rr.iter().flat_map(|(v, _)| split_values(v)).collect();
-    let rr_lines = rr.iter().map(|(_, l)| String::from_utf8_lossy(l).into_owned()).collect::<String>();
-
+    let Some(ua) = inner.ua.get() else {
+        let _ = ctx.reply_with(503, "Service Unavailable", &warn("not started"));
+        return -1;
+    };
     let adv = ctx.advertise(ctx.src.proto);
     let media_ip = inner.cfg.media_ip.unwrap_or_else(|| adv.ip());
     if media_ip.is_unspecified() {
@@ -501,133 +520,70 @@ fn answer(inner: &Arc<Inner>, ctx: &mut Ctx<'_, '_>, provider: &str, prompt: &st
         return -1;
     };
     let local = SocketAddr::new(media_ip, sock.local_addr().map_or(0, |a| a.port()));
-    let transport =
-        if ctx.src.proto == sip_core::net::Proto::Udp { String::new() } else { format!(";transport={}", ctx.src.proto.via_name().to_ascii_lowercase()) };
-    let host = match adv.ip() {
-        IpAddr::V6(ip) => format!("[{ip}]:{}", adv.port()),
-        ip => format!("{ip}:{}", adv.port()),
-    };
     let (tx, rx) = std::sync::mpsc::channel();
-    let tag = format!("{:016x}", sip_core::shm::fx_hash(callid.as_bytes()));
     let call = Arc::new(Call {
-        tag,
+        leg: OnceLock::new(),
         kind,
         from_hdr,
         to_hdr,
-        contact,
-        routes,
-        rr_lines,
-        src: ctx.src,
-        invite: buf.to_vec(),
         codec,
         local,
-        contact_uri: format!("sip:ai@{host}{transport}"),
         prompt,
         voice: voice.to_string(),
         session_id: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs()),
         started: Instant::now(),
         created: SystemTime::now(),
-        st: Mutex::new(St {
-            phase: Phase::Connecting,
-            last_reply: None,
-            remote: offer.addr,
-            ended: None,
-            cancelled: false,
-            sdp_version: 1,
-            reason: String::new(),
-        }),
+        st: Mutex::new(St { phase: Phase::Connecting, remote: offer.addr, ended: None, cancelled: false, sdp_version: 1, reason: String::new() }),
         tx: Mutex::new(tx),
         rtp_in: AtomicU64::new(0),
         rtp_out: AtomicU64::new(0),
         stopping: AtomicBool::new(false),
         callid: callid.clone(),
     });
+    // Known before the engine sees the INVITE, so a CANCEL or a
+    // retransmission handled by another worker finds the call at once.
     {
         let mut calls = lock(&inner.calls);
         calls.insert(callid.clone(), call.clone());
         inner.any.store(true, Ordering::Relaxed);
     }
+    // The engine takes the INVITE (and sends 100 Trying); if it refuses
+    // it (420, 400…) it has answered it already.
+    let Some(leg) = ua.input(ctx.msg.buf, ctx.src, Some(&call)) else {
+        lock(&inner.calls).remove(&callid);
+        return -1;
+    };
     inner.active.fetch_add(1, Ordering::Relaxed);
     inner.total.fetch_add(1, Ordering::Relaxed);
-    let _ = ctx.reply(100, "Trying");
     let (i, c) = (inner.clone(), call.clone());
     let spawned = std::thread::Builder::new().name("ai-call".into()).spawn(move || call::run(i, c, rx, sock));
     if spawned.is_err() {
         inner.active.fetch_sub(1, Ordering::Relaxed);
         lock(&inner.calls).remove(&callid);
-        let _ = ctx.reply_with(503, "Service Unavailable", &warn("cannot start the call"));
+        let warning = sip_ua::Header::new("Warning", "399 ferrosip \"cannot start the call\"");
+        let r = sip_ua::RejectRequest { leg, code: 503, reason: None, headers: vec![warning] };
+        let _ = inner.ua_command(sip_ua::UaCommand::Reject(r));
         return -1;
     }
     sip_core::elog!("ai: call {callid} from {} answered by {} ({} {})", call.from_hdr, kind.name(), codec.name(), offer.addr);
     1
 }
 
-fn resend(ctx: &mut Ctx<'_, '_>, c: &Call) {
-    let last = c.lock().last_reply.clone();
-    match last {
-        Some(r) => {
-            let src = ctx.src;
-            let _ = ctx.send(&src, &r);
-        }
-        None => {
-            let _ = ctx.reply(100, "Trying");
-        }
-    }
-}
-
-/// Requests within (or about) a call we answered. -1: not ours.
+/// Requests within (or about) a call we answered: the UA engine handles
+/// them (ACK, BYE, CANCEL, re-INVITE, retransmissions, OPTIONS/INFO/UPDATE).
+/// -1: not ours.
 fn in_dialog(inner: &Inner, ctx: &mut Ctx<'_, '_>) -> i32 {
     if !inner.any.load(Ordering::Relaxed) || ctx.msg.parse_headers(HdrFlags::EOH).is_err() {
         return -1;
     }
     let Some(cid) = ctx.msg.get(HdrKind::CallId) else { return -1 };
-    let Some(c) = lock(&inner.calls).get(&text(cid.body)).cloned() else { return -1 };
-    let to = ctx.msg.get(HdrKind::To).map(|h| text(h.body)).unwrap_or_default();
-    let method = ctx.msg.method();
-    // The exact tag: a longer one that merely starts with ours is not ours.
-    if to_tag(&to).is_some_and(|t| !t.eq_ignore_ascii_case(&c.tag)) {
-        // Same Call-ID, another dialog (a fork elsewhere).
-        if method != Some(Method::Ack) {
-            let _ = ctx.reply(481, "Call/Transaction Does Not Exist");
-        }
-        return 1;
+    let callid = text(cid.body);
+    let Some(c) = lock(&inner.calls).get(&callid).cloned() else { return -1 };
+    if !settled(inner, &c, &callid) {
+        return 1; // the engine refused its INVITE: nothing to match
     }
-    let phase = c.lock().phase;
-    match method {
-        Some(Method::Invite) if !has_tag(&to) => resend(ctx, &c),
-        Some(Method::Ack) => c.send(Ev::Ack),
-        Some(Method::Cancel) => {
-            let _ = ctx.reply(200, "OK");
-            let mut st = c.lock();
-            if st.phase == Phase::Connecting {
-                st.cancelled = true;
-            }
-        }
-        _ if phase == Phase::Done => {
-            let _ = ctx.reply(481, "Call/Transaction Does Not Exist");
-        }
-        Some(Method::Bye) => {
-            let _ = ctx.reply(200, "OK");
-            c.send(Ev::Bye);
-        }
-        Some(Method::Invite) => {
-            // re-INVITE (hold, new address): same stream, new version.
-            let body = String::from_utf8_lossy(&ctx.body()).into_owned();
-            let version = {
-                let mut st = c.lock();
-                st.sdp_version = st.sdp_version.saturating_add(1);
-                st.sdp_version
-            };
-            if let Ok(o) = sdp::parse_offer(&body) {
-                c.send(Ev::Remote(o.addr));
-            }
-            ctx.ext_mut::<ReplyExtra>().body = Some(("application/sdp".into(), c.sdp(version).into_bytes()));
-            let _ = ctx.reply_with(200, "OK", format!("Contact: <{}>\r\n", c.contact_uri).as_bytes());
-        }
-        _ => {
-            let _ = ctx.reply(200, "OK"); // OPTIONS, INFO, UPDATE without SDP…
-        }
-    }
+    let Some(u) = inner.ua.get() else { return -1 };
+    u.input(ctx.msg.buf, ctx.src, None);
     1
 }
 
@@ -660,7 +616,6 @@ mod tests {
     fn helpers() {
         assert_eq!(uri_of("\"A\" <sip:a@h;lr>;x=1"), "sip:a@h;lr");
         assert_eq!(uri_of("sip:a@h;expires=1"), "sip:a@h");
-        assert_eq!(split_values("<sip:a;lr>, \"x,y\" <sip:b>,<sip:c>"), vec!["<sip:a;lr>", "\"x,y\" <sip:b>", "<sip:c>"]);
         assert!(has_tag("<sip:b@h>;TAG=1"));
         let mut p = HashMap::new();
         assert!(config(&p).is_ok());
@@ -689,22 +644,6 @@ mod tests {
         ];
         for &(v, want) in cases {
             assert_eq!(uri_of(v), want, "uri_of({v:?})");
-        }
-    }
-
-    #[test]
-    fn split_values_cases() {
-        let cases: &[(&str, &[&str])] = &[
-            ("", &[]),
-            ("<sip:a>", &["<sip:a>"]),
-            ("<sip:a>,<sip:b>", &["<sip:a>", "<sip:b>"]),
-            (" <sip:a;x=\"1,2\"> , <sip:b> ,", &["<sip:a;x=\"1,2\">", "<sip:b>"]),
-            ("<sip:a,b>", &["<sip:a,b>"]),
-            ("\"a>b, c\" <sip:x>", &["\"a>b, c\" <sip:x>"]),
-            (",,", &["", ""]),
-        ];
-        for &(v, want) in cases {
-            assert_eq!(split_values(v), want, "split_values({v:?})");
         }
     }
 

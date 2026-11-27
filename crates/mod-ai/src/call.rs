@@ -1,20 +1,18 @@
-//! One AI call: the SIP dialog we answer (UAS), its RTP stream, and the
-//! provider WebSocket, run by one thread per call.
+//! One AI call: its RTP stream and the provider WebSocket, run by one
+//! thread per call. The SIP dialog is the shared UA engine's (`ua.rs`):
+//! this thread answers, rejects and hangs up through it.
 
 use crate::audio::Codec;
 use crate::provider::{self, Action, Kind, Session, Setup};
 use crate::wsc::{self, Event};
 use crate::{Config, Inner};
-use bumpalo::Bump;
-use mod_txn::UacRequest;
-use sip_core::net::Dest;
 use sip_core::sync::lock;
-use sip_parser::Msg;
+use sip_ua::{AcceptRequest, HangupRequest, Header, RejectRequest, UaCommand, UaLegId};
 use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// 20 ms of 8 kHz audio.
@@ -22,15 +20,6 @@ const FRAME: usize = 160;
 const TICK: Duration = Duration::from_millis(20);
 /// Most audio we queue for the caller (the provider sends faster than real time).
 const MAX_QUEUE: usize = 8000 * 600;
-const T1: Duration = Duration::from_millis(500);
-const T2: Duration = Duration::from_secs(4);
-/// Give up on the ACK for our 200 OK after 64·T1 (RFC 3261 §13.3.1.4).
-const ACK_WAIT: Duration = T1.saturating_mul(64);
-
-/// `t + d`; `t` itself in the (theoretical) case the clock can't represent it.
-fn later(t: Instant, d: Duration) -> Instant {
-    t.checked_add(d).unwrap_or(t)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -39,7 +28,7 @@ pub enum Phase {
     /// 200 OK sent, waiting for the ACK.
     Answered,
     Up,
-    /// Over; kept a little while to absorb retransmissions.
+    /// Over; kept a little while so its retransmissions reach the engine.
     Done,
 }
 
@@ -60,12 +49,12 @@ pub enum Ev {
     /// A re-INVITE moved the caller's media.
     Remote(SocketAddr),
     Stop,
+    /// The engine ended the dialog (e.g. no ACK for our 200 OK; it sent the BYE).
+    Ended(String),
 }
 
 pub struct St {
     pub phase: Phase,
-    /// Our last response to the INVITE, for retransmitted INVITEs.
-    pub last_reply: Option<Vec<u8>>,
     pub remote: SocketAddr,
     pub ended: Option<Instant>,
     pub cancelled: bool,
@@ -75,21 +64,15 @@ pub struct St {
 
 pub struct Call {
     pub callid: String,
-    pub tag: String,
+    /// The call's leg in the UA engine (set when the engine takes the INVITE).
+    pub leg: OnceLock<UaLegId>,
     pub kind: Kind,
     /// The caller's From (with its tag) and our To (without ours).
     pub from_hdr: String,
     pub to_hdr: String,
-    pub contact: String,
-    /// Record-Route values, in order: our route set back to the caller.
-    pub routes: Vec<String>,
-    pub rr_lines: String,
-    pub src: Dest,
-    pub invite: Vec<u8>,
     pub codec: Codec,
     /// Our RTP address as advertised in SDP.
     pub local: SocketAddr,
-    pub contact_uri: String,
     /// The system prompt and voice override this call was answered with.
     pub prompt: String,
     pub voice: String,
@@ -114,21 +97,6 @@ impl Call {
 
     pub fn sdp(&self, version: u64) -> String {
         crate::sdp::answer(self.local.ip(), self.local.port(), self.codec, self.session_id, version)
-    }
-
-    /// A response to the INVITE (To-tag added by the builder: the same one
-    /// as `self.tag`).
-    pub fn reply(&self, code: u16, reason: &str, extra: &str, body: Option<&str>) -> Option<Vec<u8>> {
-        let arena = Bump::new();
-        let mut msg = Msg::parse(&self.invite, &arena).ok()?;
-        let mut out = Vec::new();
-        sip_core::reply::build_reply_body(&mut msg, code, reason, extra.as_bytes(), body.map(|b| ("application/sdp", b.as_bytes())), &mut out).ok()?;
-        Some(out)
-    }
-
-    pub fn answer_200(&self, version: u64) -> Option<Vec<u8>> {
-        let extra = format!("{}Contact: <{}>\r\nAllow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\n", self.rr_lines, self.contact_uri);
-        self.reply(200, "OK", &extra, Some(&self.sdp(version)))
     }
 
     pub fn json(&self) -> serde_json::Value {
@@ -178,6 +146,8 @@ pub fn call_hist(kind: Kind, outcome: &str) -> &'static sip_core::stats::Histogr
 enum End {
     CallerBye,
     Bye(String),
+    /// The engine ended the dialog itself (and sent what was owed).
+    Gone(String),
     /// Never answered (final non-2xx sent): nothing to hang up.
     Failed(&'static str, String),
 }
@@ -242,7 +212,7 @@ pub fn run(inner: Arc<Inner>, call: Arc<Call>, rx: Receiver<Ev>, sock: UdpSocket
     let end = session(&inner, &call, &rx, &sock, &call.prompt, &call.voice);
     let (outcome, reason) = match &end {
         End::CallerBye => ("answered", "caller hung up".to_string()),
-        End::Bye(r) => ("answered", r.clone()),
+        End::Bye(r) | End::Gone(r) => ("answered", r.clone()),
         End::Failed(o, r) => (*o, r.clone()),
     };
     {
@@ -267,36 +237,22 @@ pub fn run(inner: Arc<Inner>, call: Arc<Call>, rx: Receiver<Ev>, sock: UdpSocket
     sip_core::elog!("ai: call {} ({}) ended after {}s: {reason}", call.callid, call.kind.name(), call.started.elapsed().as_secs());
 }
 
-/// Hang up: the caller sent nothing back yet, or we're done.
+/// Hang up (BYE) through the engine.
 fn bye(inner: &Inner, call: &Call) {
-    let dst = match call.routes.first() {
-        Some(r) => sip_core::pvcore::dest_from_uri(crate::uri_of(r).as_bytes()),
-        None => Some(call.src),
-    };
-    let mut headers = format!("From: {};tag={}\r\nTo: {}\r\n", call.to_hdr, call.tag, call.from_hdr);
-    if !call.routes.is_empty() {
-        headers.push_str(&format!("Route: {}\r\n", call.routes.join(",")));
-    }
-    let r = UacRequest { method: "BYE".into(), ruri: call.contact.clone(), dst, call_id: Some(call.callid.clone()), cseq: 1, headers, ..Default::default() };
-    if let Err(e) = inner.tm.t_uac(r, None) {
-        sip_core::elog!("ai: call {}: cannot send BYE: {e}", call.callid);
+    let Some(&leg) = call.leg.get() else { return };
+    if let Err(e) = inner.ua_command(UaCommand::Hangup(HangupRequest { leg, reason: None, code: None })) {
+        sip_core::elog!("ai: call {}: cannot hang up: {e}", call.callid);
     }
 }
 
-fn send_sip(inner: &Inner, call: &Call, data: &[u8]) {
-    if let Some(net) = inner.net.get()
-        && let Err(e) = net.send(&call.src, data)
-    {
-        sip_core::elog!("ai: call {}: send to {:?} failed: {e}", call.callid, call.src.addr);
-    }
-}
-
-/// Final non-2xx for the INVITE (the caller ACKs it; ai_dialog absorbs that).
+/// Final non-2xx for the INVITE, with the reason in a Warning.
 fn fail(inner: &Inner, call: &Call, code: u16, reason: &str, why: &str) -> End {
-    let warn = format!("Warning: 399 ferrosip \"{}\"\r\n", why.replace(['"', '\r', '\n'], " "));
-    if let Some(r) = call.reply(code, reason, &warn, None) {
-        send_sip(inner, call, &r);
-        call.lock().last_reply = Some(r);
+    if let Some(&leg) = call.leg.get() {
+        let warning = Header::new("Warning", format!("399 ferrosip \"{}\"", why.replace(['"', '\r', '\n'], " ")));
+        let r = RejectRequest { leg, code, reason: Some(reason.to_string()), headers: vec![warning] };
+        if inner.ua_command(UaCommand::Reject(r)).is_err() && call.lock().cancelled {
+            return fail_487();
+        }
     }
     End::Failed("failed", why.to_string())
 }
@@ -317,7 +273,7 @@ fn session(inner: &Inner, call: &Call, rx: &Receiver<Ev>, sock: &UdpSocket, prom
         }
         Err(e) if call.lock().cancelled => {
             let _ = e;
-            return fail_487(inner, call);
+            return fail_487();
         }
         Err(e) => {
             // The URL carries Gemini's key: log the host only.
@@ -333,22 +289,24 @@ fn session(inner: &Inner, call: &Call, rx: &Receiver<Ev>, sock: &UdpSocket, prom
             return fail(inner, call, 503, "Service Unavailable", &format!("provider session: {e}"));
         }
     }
-    // Answer, unless a CANCEL won the race.
-    {
-        let mut st = call.lock();
+    // Answer, unless a CANCEL won the race (the engine answered it 487).
+    let version = {
+        let st = call.lock();
         if st.cancelled {
-            drop(st);
-            return fail_487(inner, call);
+            return fail_487();
         }
-        let Some(ok) = call.answer_200(st.sdp_version) else { return End::Failed("failed", "cannot build the 200 OK".into()) };
-        st.phase = Phase::Answered;
-        st.last_reply = Some(ok.clone());
-        drop(st);
-        send_sip(inner, call, &ok);
+        st.sdp_version
+    };
+    let Some(&leg) = call.leg.get() else { return End::Failed("failed", "no SIP leg".into()) };
+    let accept = AcceptRequest { leg, sdp: Some(call.sdp(version).into_bytes()), headers: Vec::new() };
+    if let Err(e) = inner.ua_command(UaCommand::Accept(accept)) {
+        if call.lock().cancelled {
+            return fail_487();
+        }
+        return End::Failed("failed", format!("cannot answer: {e}"));
     }
+    call.lock().phase = Phase::Answered;
     let answered = Instant::now();
-    let udp = matches!(call.src.proto, sip_core::net::Proto::Udp);
-    let (mut rt_at, mut rt_every) = (later(answered, T1), T1);
     let mut acked = false;
 
     let mut seed = [0u8; 10];
@@ -379,18 +337,7 @@ fn session(inner: &Inner, call: &Call, rx: &Receiver<Ev>, sock: &UdpSocket, prom
                     latched = false;
                 }
                 Ev::Stop => return End::Bye("shutting down".into()),
-            }
-        }
-        if !acked {
-            if now.duration_since(answered) > ACK_WAIT {
-                return End::Bye("no ACK for 200 OK".into());
-            }
-            if udp && now >= rt_at {
-                if let Some(r) = call.lock().last_reply.clone() {
-                    send_sip(inner, call, &r);
-                }
-                rt_every = rt_every.saturating_mul(2).min(T2);
-                rt_at = later(now, rt_every);
+                Ev::Ended(why) => return End::Gone(why),
             }
         }
         if now.duration_since(answered) > cfg.max_duration {
@@ -488,11 +435,9 @@ fn session(inner: &Inner, call: &Call, rx: &Receiver<Ev>, sock: &UdpSocket, prom
     }
 }
 
-fn fail_487(inner: &Inner, call: &Call) -> End {
-    if let Some(r) = call.reply(487, "Request Terminated", "", None) {
-        send_sip(inner, call, &r);
-        call.lock().last_reply = Some(r);
-    }
+/// The caller cancelled: the engine already answered 200 to the CANCEL
+/// and 487 to the INVITE.
+fn fail_487() -> End {
     End::Failed("cancelled", "cancelled by the caller".into())
 }
 
@@ -574,43 +519,23 @@ mod tests {
     }
 
     #[test]
-    fn phases_and_timers() {
+    fn phases() {
         let names: Vec<&str> = [Phase::Connecting, Phase::Answered, Phase::Up, Phase::Done].iter().map(|p| p.name()).collect();
         assert_eq!(names, ["connecting", "answered", "up", "done"]);
-        assert_eq!(ACK_WAIT, Duration::from_secs(32), "64·T1 (RFC 3261 §13.3.1.4)");
         assert_eq!(FRAME, 160, "20 ms at 8 kHz");
-        // 200 OK retransmissions: T1, doubling, capped at T2.
-        let mut every = T1;
-        let mut gaps = Vec::new();
-        for _ in 0..6 {
-            gaps.push(every.as_millis());
-            every = every.saturating_mul(2).min(T2);
-        }
-        assert_eq!(gaps, [500, 1000, 2000, 4000, 4000, 4000]);
-        let t = Instant::now();
-        assert_eq!(later(t, Duration::from_secs(1)).duration_since(t), Duration::from_secs(1));
-        assert_eq!(later(t, Duration::MAX), t, "an unrepresentable time stays at t");
         assert_eq!(OUTCOMES, ["answered", "failed", "cancelled"]);
     }
 
     fn test_call() -> Call {
-        let invite = "INVITE sip:ai@x SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.5:5060;branch=z9hG4bK1\r\nFrom: <sip:a@x>;tag=f1\r\nTo: <sip:ai@x>\r\n\
-                      Call-ID: abc@h\r\nCSeq: 1 INVITE\r\nContact: <sip:a@192.0.2.5>\r\nContent-Length: 0\r\n\r\n";
         let (tx, _rx) = std::sync::mpsc::channel();
         Call {
             callid: "abc@h".into(),
-            tag: format!("{:016x}", sip_core::shm::fx_hash(b"abc@h")),
+            leg: OnceLock::new(),
             kind: Kind::OpenAi,
             from_hdr: "<sip:a@x>;tag=f1".into(),
             to_hdr: "<sip:ai@x>".into(),
-            contact: "sip:a@192.0.2.5".into(),
-            routes: Vec::new(),
-            rr_lines: "Record-Route: <sip:p1;lr>\r\n".into(),
-            src: Dest::new(sip_core::net::Proto::Udp, "192.0.2.5:5060".parse().unwrap()),
-            invite: invite.as_bytes().to_vec(),
             codec: Codec::Pcma,
             local: "192.0.2.1:30000".parse().unwrap(),
-            contact_uri: "sip:ai@192.0.2.1:5060".into(),
             prompt: "P".into(),
             voice: String::new(),
             session_id: 42,
@@ -618,7 +543,6 @@ mod tests {
             created: SystemTime::UNIX_EPOCH,
             st: Mutex::new(St {
                 phase: Phase::Connecting,
-                last_reply: None,
                 remote: "192.0.2.5:4000".parse().unwrap(),
                 ended: None,
                 cancelled: false,
@@ -633,17 +557,9 @@ mod tests {
     }
 
     #[test]
-    fn the_200_ok_carries_our_tag_contact_and_sdp() {
+    fn the_sdp_answer_carries_our_session_and_version() {
         let c = test_call();
-        let ok = String::from_utf8(c.answer_200(3).unwrap()).unwrap();
-        assert!(ok.starts_with("SIP/2.0 200 OK\r\n"), "{ok}");
-        assert!(ok.contains(&format!("To: <sip:ai@x>;tag={}\r\n", c.tag)), "the reply builder's To-tag is the call's tag: {ok}");
-        assert!(ok.contains("Record-Route: <sip:p1;lr>\r\nContact: <sip:ai@192.0.2.1:5060>\r\nAllow: INVITE, ACK, BYE, CANCEL, OPTIONS\r\n"), "{ok}");
-        assert!(ok.contains("Content-Type: application/sdp\r\n"), "{ok}");
-        assert!(ok.ends_with(&c.sdp(3)), "{ok}");
         assert!(c.sdp(3).contains("o=ferrosip 42 3 IN IP4 192.0.2.1\r\n"));
-        let busy = String::from_utf8(c.reply(487, "Request Terminated", "", None).unwrap()).unwrap();
-        assert!(busy.starts_with("SIP/2.0 487 Request Terminated\r\n") && busy.ends_with("Content-Length: 0\r\n\r\n"), "{busy}");
     }
 
     #[test]

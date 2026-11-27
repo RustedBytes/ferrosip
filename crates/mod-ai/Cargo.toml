@@ -12,7 +12,8 @@ version.workspace = true
 sip-parser.workspace = true
 sip-core.workspace = true
 sip-transport.workspace = true
-mod-txn.workspace = true
+# The SIP side of AI calls (sans-IO UA engine; the proxy's transport sends).
+sip-ua = { workspace = true, default-features = false }
 bumpalo.workspace = true
 serde_json.workspace = true
 ring.workspace = true
