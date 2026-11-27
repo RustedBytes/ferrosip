@@ -369,7 +369,8 @@ class UA:
         self.received = []   # every request seen (for checks)
         self.nc = {}
         self.tags = {}
-        threading.Thread(target=self._reader, daemon=True).start()
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
 
     # -- plumbing
     def _reader(self):
@@ -389,6 +390,10 @@ class UA:
 
     def close(self):
         self.t.close()
+        # The port is free only once the reader has left recvfrom (a
+        # blocked call keeps the socket alive past close()).
+        if self._thread is not threading.current_thread():
+            self._thread.join(2)
 
     @property
     def aor(self):
