@@ -91,6 +91,29 @@ def reinvite_and_bye(caller, d, label):
     check(f"{label}: BYE answered 200 (not 481)", b is not None and b.code == 200, repr(b))
 
 
+def transact(caller, sent, method, tries=10):
+    """A UDP client transaction: retransmit the same request (same branch)
+    every 500 ms until a final arrives (RFC 3261 timers A/E, shortened)."""
+    for n in range(tries):
+        r = caller.final(0.5, method=method, call_id=sent["call_id"], cseq=sent["cseq"])
+        if r is not None:
+            if n:
+                print(f"INFO {method} answered after {n} retransmission(s)")
+            return r
+        caller.send(sent["raw"])
+    return None
+
+
+def reinvite_and_bye_retransmitting(caller, d, label):
+    sent = d.request("INVITE", body=sdp(6491))
+    r = transact(caller, sent, "INVITE")
+    check(f"{label}: re-INVITE answered 200 in the restored dialog", r is not None and r.code == 200, repr(r))
+    if r is not None and r.code == 200:
+        d.request("ACK", cseq=d.cseq)
+    b = transact(caller, d.request("BYE"), "BYE")
+    check(f"{label}: BYE answered 200 (not 481)", b is not None and b.code == 200, repr(b))
+
+
 def sigkill_established(extra=(), label="SIGKILL"):
     d = tempfile.mkdtemp(prefix="sipua-rec-")
     p = Proc(d, extra=extra)
@@ -165,11 +188,11 @@ def outbound_killed_while_ringing():
         shutil.rmtree(d, ignore_errors=True)
 
 
-def takeover_with_two_live_incarnations():
+def takeover_with_two_live_incarnations(caller_port):
     d = tempfile.mkdtemp(prefix="sipua-rec-")
     old = Proc(d, extra=("--epoch", "1"))
     new = None
-    caller = UA("alice", CALLER, ("127.0.0.1", UAP))
+    caller = UA("alice", caller_port, ("127.0.0.1", UAP))
     try:
         r, dlg = caller.call(f"sip:ua@127.0.0.1:{UAP}", body=sdp(6491))
         check("takeover: call answered by epoch 1", r is not None and r.code == 200 and any(l.startswith("SENT 1 SIP/2.0 200") for l in old.lines), (repr(r), old.lines))
@@ -183,15 +206,18 @@ def takeover_with_two_live_incarnations():
         stale = Proc(d, extra=("--epoch", "1", "--takeover"), ready=False)
         check("takeover: a stale epoch is refused", stale.wait_for("REFUSED", 5) is not None and stale.died(5), stale.lines)
         old.p.send_signal(signal.SIGCONT)
-        # The caller's requests may reach either socket; the old owner must
-        # answer none of them, and the new owner all.
-        reinvite_and_bye(caller, dlg, "takeover")
+        # The kernel hands the caller's datagrams to one of the two sockets
+        # (by address hash). If it is the old owner's, that process halts
+        # on the fence and exits, and the caller's retransmission reaches
+        # the new owner, as with any UDP client.
+        reinvite_and_bye_retransmitting(caller, dlg, "takeover")
         time.sleep(0.5)
         leaked = [l for l in old.lines[paused_at:] if l.startswith("SENT")]
         check("takeover: the old owner sent nothing after the takeover", not leaked, leaked)
         check("takeover: everything the new owner sent is epoch 2", all(l.startswith("SENT 2 ") for l in new.lines if l.startswith("SENT")), new.lines)
         halted = old.p.poll() is not None
-        print(f"INFO takeover: old owner {'halted (' + next((l for l in old.lines if l.startswith('HALT')), '?') + ')' if halted else 'still running (got no traffic)'}")
+        print(f"INFO takeover (caller port {caller_port}): old owner {'halted (' + next((l for l in old.lines if l.startswith('HALT')), '?') + ')' if halted else 'still running (got no traffic)'}")
+        return halted
     finally:
         caller.close()
         if old.p.poll() is None:
@@ -237,7 +263,10 @@ def main():
     for b in ("pre-commit", "post-commit", "post-send"):
         abort_around_the_200(b)
     outbound_killed_while_ringing()
-    takeover_with_two_live_incarnations()
+    # Several caller addresses, so both kernel choices (old or new socket)
+    # are exercised wherever this runs.
+    halted = [takeover_with_two_live_incarnations(port) for port in (5491, 5493, 5494, 5495)]
+    print(f"INFO takeover: the old owner got traffic and halted in {sum(bool(h) for h in halted)} of {len(halted)} runs")
     lease_lapse_stops_a_cut_off_owner()
     print(f"{'FAIL' if FAILS else 'OK'}: {len(FAILS)} failed")
     return 1 if FAILS else 0
