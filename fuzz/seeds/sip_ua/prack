@@ -1,0 +1,9 @@
+PRACK sip:ua@127.0.0.1 SIP/2.0
+Via: SIP/2.0/UDP 127.0.0.2:5060;branch=z9hG4bKp1
+From: <sip:a@x>;tag=ft
+To: <sip:ua@x>;tag=TAG
+Call-ID: fz
+CSeq: 2 PRACK
+RAck: 1 1 INVITE
+Content-Length: 0
+

@@ -155,9 +155,13 @@ jobs:
           for f in sqlite mysql postgres; do
             cargo clippy --release -p sip-db --all-targets --no-default-features --features $f -- -D warnings
           done
+          # sip-ua: without ferrosip's transports, and with the usrloc adapter.
+          cargo clippy --release -p sip-ua --no-default-features -- -D warnings
+          cargo clippy --release -p sip-ua --all-targets --features location -- -D warnings
       # Test certificates (gitignored) for the TLS unit tests.
       - run: etc/tls/gen-certs.sh
       - run: cargo test --release --workspace --features ferrosip/db-all
+      - run: cargo test --release -p sip-ua --features location --test routing_location
       - name: Script formatting
         run: target/release/ferroctl fmt --check etc/ferrosip.cfg
       - name: Kamailio configs (ferrosip -c)

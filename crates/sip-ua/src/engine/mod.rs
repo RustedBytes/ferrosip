@@ -25,6 +25,18 @@ use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+mod failover;
+mod prack;
+mod redirect;
+mod refer;
+mod session_timer;
+
+use failover::Failover;
+use prack::{EarlyDialog, PeerRel, Prack};
+use redirect::Redirects;
+use refer::ReferState;
+use session_timer::SessionTimer;
+
 /// Engine configuration.
 #[derive(Clone, Debug)]
 pub struct UaConfig {
@@ -46,6 +58,30 @@ pub struct UaConfig {
     pub no_answer_timeout_ms: u64,
     /// Inbound INVITEs get 480 after this without a final from the application.
     pub uas_answer_timeout_ms: u64,
+    /// RFC 4028 session interval to ask for / grant, seconds (None: only
+    /// honour the peer's request).
+    pub session_expires: Option<u32>,
+    /// Smallest session interval we accept (RFC 4028 Min-SE, ≥ 90).
+    pub min_se: u32,
+    /// RFC 3263: with more resolved targets left, move the initial INVITE
+    /// to the next one when nothing answered within this (0: only on
+    /// errors, timeouts and 503).
+    pub failover_timeout_ms: u64,
+    /// Our REFER's subscription must end within this.
+    pub refer_timeout_ms: u64,
+    /// Follow up to this many 3xx for an outbound INVITE (0: report them
+    /// to the application, contacts in the failure cause).
+    pub max_redirects: u8,
+    /// RFC 3325 trust domain (default: nobody).
+    pub trust: crate::identity::TrustPolicy,
+    /// Early dialogs (forks) kept per outbound leg; 1xx with further new
+    /// tags are ignored. The first 2xx wins; later ones are ACKed and BYEd.
+    pub max_early_dialogs: usize,
+    /// Tolerate clients that change the Via branch of a retransmitted
+    /// INVITE or of a CANCEL (an RFC 3261 violation): match them to the
+    /// inbound INVITE by Call-ID, From tag, CSeq and top-Via sent-by, the
+    /// RFC 2543 way. Off: such an INVITE gets 482, such a CANCEL 481.
+    pub lenient_matching: bool,
 }
 
 impl Default for UaConfig {
@@ -62,15 +98,46 @@ impl Default for UaConfig {
             answer_timeout_ms: 5_000,
             no_answer_timeout_ms: 120_000,
             uas_answer_timeout_ms: 180_000,
+            session_expires: Some(1_800),
+            min_se: 90,
+            failover_timeout_ms: 4_000,
+            refer_timeout_ms: 180_000,
+            max_redirects: 0,
+            trust: crate::identity::TrustPolicy::default(),
+            max_early_dialogs: 16,
+            lenient_matching: false,
         }
     }
 }
 
-const ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS, INFO, UPDATE";
+const ALLOW: &str = "INVITE, ACK, BYE, CANCEL, OPTIONS, INFO, UPDATE, PRACK, REFER, NOTIFY";
+
+/// Extensions we implement (accepted in Require, listed in Supported).
+const SUPPORTED: &[&str] = &["100rel", "timer", "replaces"];
 
 /// Headers the application cannot set through `headers` (the engine owns them).
-const RESERVED: &[&str] =
-    &["via", "from", "to", "call-id", "cseq", "contact", "content-length", "content-type", "max-forwards", "route", "record-route", "require", "rseq", "rack"];
+const RESERVED: &[&str] = &[
+    "via",
+    "from",
+    "to",
+    "call-id",
+    "cseq",
+    "contact",
+    "content-length",
+    "content-type",
+    "max-forwards",
+    "route",
+    "record-route",
+    "require",
+    "rseq",
+    "rack",
+    "session-expires",
+    "min-se",
+    "replaces",
+    "p-asserted-identity",
+    "p-preferred-identity",
+    "privacy",
+];
 
 /// One message for the driver to send.
 #[derive(Clone, Debug)]
@@ -134,6 +201,8 @@ pub struct LegSnapshot {
     /// Sequence number of the last event emitted for this leg.
     pub last_seq: u64,
     pub remote_target: String,
+    /// RFC 4028: (interval seconds, we are the refresher).
+    pub session_timer: Option<(u32, bool)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -146,6 +215,12 @@ pub struct UaStats {
     pub pending_resolves: usize,
     pub malformed: u64,
     pub rejected_overload: u64,
+    /// P-Asserted-Identity removed from requests to untrusted next hops.
+    pub identity_stripped: u64,
+    /// Forked 2xx we ACKed and ended with BYE (another fork had won).
+    pub forks_terminated: u64,
+    /// 1xx ignored because their leg had `max_early_dialogs` already.
+    pub early_dialogs_dropped: u64,
     pub events_shed: u64,
 }
 
@@ -180,6 +255,10 @@ enum Purpose {
     Bye(UaLegId),
     Cancel(UaLegId),
     Info(UaLegId, OperationId),
+    /// Our session refresh (RFC 4028): UPDATE or re-INVITE.
+    Refresh(UaLegId),
+    /// Our REFER (RFC 3515).
+    Refer(UaLegId, OperationId),
     /// Responses are not needed (fork-loser BYE, stateless replies).
     Detached,
 }
@@ -204,6 +283,20 @@ enum LegTimer {
     CancelGuard,
     /// UAS: the application never sent a final.
     UasAnswer,
+    /// RFC 4028: time to refresh (we are the refresher).
+    SessionRefresh,
+    /// RFC 4028: no refresh in time.
+    SessionExpire,
+    /// RFC 3262: retransmit our reliable provisional.
+    Rel1xxRetransmit,
+    /// RFC 3262: no PRACK in 64·T1.
+    Rel1xxGiveUp,
+    /// RFC 3263: no response from this target yet: try the next.
+    FailoverProbe,
+    /// RFC 3515: our REFER's subscription never terminated.
+    ReferGuard,
+    /// RFC 3515: the application did not answer the peer's REFER.
+    ReferAnswer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -223,6 +316,10 @@ enum OfferVia {
     TheirTwoXx,
     ReInvite,
     Update,
+    /// UAS: our offer in a reliable 1xx; the answer comes in the PRACK.
+    OurReliable1xx,
+    /// UAC: their offer in a reliable 1xx; the answer goes in the PRACK.
+    TheirReliable1xx,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,6 +342,22 @@ struct Pending2xx {
     bytes: Arc<[u8]>,
     dest: Dest,
     interval: u64,
+}
+
+/// Leg state added by protocol extensions.
+#[derive(Debug, Default)]
+struct LegExt {
+    st: SessionTimer,
+    rel: Prack,
+    fo: Failover,
+    refer: ReferState,
+    redir: Redirects,
+    /// The peer's latest SDP offered RFC 4733 telephone-event.
+    rtp_dtmf: bool,
+    /// The SDP we last sent as an offer or answer (session refresh re-INVITEs).
+    local_sdp: Option<Vec<u8>>,
+    /// Our offer in a pending `Negotiate`; becomes `local_sdp` when answered.
+    offered_sdp: Option<Vec<u8>>,
 }
 
 struct Leg {
@@ -270,8 +383,8 @@ struct Leg {
     /// UAC: the INVITE without Via/CSeq/auth, to rebuild for auth retries.
     invite_template: Option<SipMessage>,
     invite_dest: Option<Dest>,
-    /// Remote tags of early dialogs (forks) seen so far.
-    early: Vec<String>,
+    /// UAC: early dialogs (forks) seen so far.
+    early: Vec<EarlyDialog>,
     /// 2xx from forks we did not keep: (tag, ACK bytes, dest) to re-ACK retransmissions.
     killed: Vec<(String, Arc<[u8]>, Dest)>,
     oa: Oa,
@@ -308,6 +421,7 @@ struct Leg {
     merged_key: Option<(String, String, u32)>,
     /// Remote tags registered in the dialog index.
     dialog_tags: Vec<String>,
+    ext: LegExt,
 }
 
 impl Leg {
@@ -404,8 +518,38 @@ fn reason_text(code: u16) -> &'static str {
         181 => "Call Is Being Forwarded",
         182 => "Queued",
         183 => "Session Progress",
+        199 => "Early Dialog Terminated",
         200 => "OK",
+        202 => "Accepted",
+        300 => "Multiple Choices",
+        301 => "Moved Permanently",
+        302 => "Moved Temporarily",
+        380 => "Alternative Service",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        402 => "Payment Required",
+        406 => "Not Acceptable",
+        407 => "Proxy Authentication Required",
+        410 => "Gone",
+        413 => "Request Entity Too Large",
+        414 => "Request-URI Too Long",
+        416 => "Unsupported URI Scheme",
+        421 => "Extension Required",
+        422 => "Session Interval Too Small",
+        423 => "Interval Too Brief",
+        483 => "Too Many Hops",
+        484 => "Address Incomplete",
+        485 => "Ambiguous",
+        489 => "Bad Event",
+        493 => "Undecipherable",
+        502 => "Bad Gateway",
+        504 => "Server Time-out",
+        505 => "Version Not Supported",
+        513 => "Message Too Large",
+        580 => "Precondition Failure",
+        600 => "Busy Everywhere",
+        604 => "Does Not Exist Anywhere",
+        606 => "Not Acceptable",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -566,6 +710,7 @@ impl UaEngine {
             offer: l.offer_state(),
             last_seq: l.seq,
             remote_target: l.remote_target.clone(),
+            session_timer: l.ext.st.interval.map(|i| (i, l.ext.st.we_refresh)),
         })
     }
 
@@ -644,6 +789,19 @@ impl UaEngine {
     }
 
     fn emit(&mut self, leg: &mut Leg, op: Option<OperationId>, event: UaEvent) {
+        // Every SDP from the peer reaches the application through an event.
+        let remote_sdp = match &event {
+            UaEvent::IncomingInvite(e) => e.sdp.as_deref(),
+            UaEvent::Provisional(e) => e.sdp.as_deref(),
+            UaEvent::Accepted(e) => e.sdp.as_deref(),
+            UaEvent::Ack(e) => e.sdp.as_deref(),
+            UaEvent::RemoteOffer(e) => e.sdp.as_deref(),
+            UaEvent::Completed(e) => e.sdp.as_deref(),
+            _ => None,
+        };
+        if let Some(b) = remote_sdp {
+            leg.ext.rtp_dtmf = crate::dtmf::sdp_has_telephone_event(b);
+        }
         if !event.is_critical() && self.events.len() >= self.cfg.max_pending_events {
             // No room: the leg is failed explicitly instead of dropping
             // this event silently (the Failed/Terminated that follow are
@@ -677,14 +835,29 @@ impl UaEngine {
             self.hangup_leg(&mut leg, Some("Q.850;cause=42".into()), Some(503), cause, now);
         }
         if leg.phase == Phase::Terminated {
-            self.cleanup(&mut leg);
+            self.cleanup(&mut leg, now);
         } else {
             self.legs.insert(id, leg);
         }
         Some(r)
     }
 
-    fn cleanup(&mut self, leg: &mut Leg) {
+    fn cleanup(&mut self, leg: &mut Leg, now: u64) {
+        // RFC 3261 §15.1.2: every request of the dialog still waiting for a
+        // final gets 487 (a non-INVITE server transaction in Trying has no
+        // timer of its own and would otherwise never end).
+        let tag = leg.local_tag.clone();
+        let pending =
+            [leg.invite_txn.filter(|_| leg.role == Role::Uas), leg.server_reinvite.take(), leg.server_update.take(), leg.ext.refer.take_server_pending()];
+        for t in pending.into_iter().flatten() {
+            let owed = self
+                .txns
+                .get(&t)
+                .is_some_and(|e| matches!(e.txn.kind, crate::txn::Kind::InviteServer | crate::txn::Kind::NonInviteServer) && !e.txn.final_sent());
+            if owed {
+                self.reply_simple(t, 487, Some(&tag), &[], now);
+            }
+        }
         for t in leg.dialog_tags.drain(..) {
             self.dialogs.remove(&(leg.call_id.clone(), leg.local_tag.clone(), t));
         }
@@ -797,7 +970,12 @@ impl UaEngine {
         }
     }
 
-    fn start_client_prepared(&mut self, req: SipMessage, dest: Dest, purpose: Purpose, key: ClientKey, now: u64) -> Result<TxnId, CommandError> {
+    fn start_client_prepared(&mut self, mut req: SipMessage, dest: Dest, purpose: Purpose, key: ClientKey, now: u64) -> Result<TxnId, CommandError> {
+        // RFC 3325 §5: an asserted identity never leaves the trust domain.
+        if req.header("P-Asserted-Identity").is_some() && !self.cfg.trust.is_trusted(dest.addr.ip()) {
+            req.remove_header("P-Asserted-Identity");
+            self.stats.identity_stripped = self.stats.identity_stripped.saturating_add(1);
+        }
         let id = self.new_txn_id();
         let (txn, outs) = Txn::client(id, req, dest, self.cfg.timers, now);
         self.client_keys.insert(key.clone(), id);
@@ -875,11 +1053,21 @@ impl UaEngine {
     /// The driver resolved a [`ResolveRequest`] (first entry is used).
     pub fn resolved(&mut self, id: u64, result: Result<Vec<Dest>, String>, now: u64) {
         let Some(p) = self.pending_resolve.remove(&id) else { return };
+        let leg_id = p.leg;
         let dest = match result {
-            Ok(v) => v.into_iter().next().ok_or_else(|| "no address".to_string()),
+            Ok(mut v) if !v.is_empty() => {
+                let first = v.remove(0);
+                if matches!(p.purpose, Purpose::Invite(_))
+                    && !p.stateless
+                    && let Some(l) = self.legs.get_mut(&leg_id)
+                {
+                    l.ext.fo.alternatives = v;
+                }
+                Ok(first)
+            }
+            Ok(_) => Err("no address".to_string()),
             Err(e) => Err(e),
         };
-        let leg_id = p.leg;
         let had_leg = self.legs.contains_key(&leg_id);
         let res = match (&dest, had_leg) {
             (Ok(d), true) => {
@@ -887,7 +1075,11 @@ impl UaEngine {
                     // The leg is in the map, so send_ack_now can record the ACK.
                     self.send_ack_now(leg_id, p.req, *d).map_err(|e| e.to_string())
                 } else {
-                    self.start_client(p.req, *d, p.purpose, now).map(|_| ()).map_err(|e| e.to_string())
+                    let r = self.start_client(p.req, *d, p.purpose, now).map(|_| ()).map_err(|e| e.to_string());
+                    if r.is_ok() && matches!(p.purpose, Purpose::Invite(_)) {
+                        self.with_leg(leg_id, now, |s, l| s.failover_armed(l, now));
+                    }
+                    r
                 }
             }
             (Ok(_), false) => Ok(()),
@@ -930,6 +1122,8 @@ impl UaEngine {
                 s.emit(l, op, UaEvent::Failed(FailureEvent { cause, leg_failed: false, retry_after_ms: None }));
             }
             Purpose::Info(_, op) => s.emit(l, Some(op), UaEvent::Failed(FailureEvent { cause, leg_failed: false, retry_after_ms: None })),
+            Purpose::Refresh(_) => s.refresh_failed(l, cause, now),
+            Purpose::Refer(_, op) => s.emit(l, Some(op), UaEvent::Failed(FailureEvent { cause, leg_failed: false, retry_after_ms: None })),
             Purpose::Cancel(_) | Purpose::Detached => {}
         });
     }
@@ -980,11 +1174,13 @@ impl UaEngine {
             LegTimer::AnswerDeadline => {
                 if let Oa::RemoteOffer(via) = leg.oa {
                     let cause = Cause::new(CauseKind::AnswerTimeout);
-                    let fatal = via == OfferVia::TheirTwoXx;
+                    let fatal = matches!(via, OfferVia::TheirTwoXx | OfferVia::TheirReliable1xx);
                     self.emit(leg, None, UaEvent::Failed(FailureEvent { cause: cause.clone(), leg_failed: fatal, retry_after_ms: None }));
                     self.answer_remote_offer(leg, None, now);
-                    if fatal {
+                    if via == OfferVia::TheirTwoXx {
                         self.send_bye(leg, Some("Q.850;cause=102".into()), cause, now);
+                    } else if via == OfferVia::TheirReliable1xx {
+                        self.cancel_leg(leg, Some("Q.850;cause=102".into()), cause, now);
                     }
                 }
             }
@@ -999,6 +1195,13 @@ impl UaEngine {
                     self.terminate(leg, cause.with_detail("no final response after CANCEL"));
                 }
             }
+            LegTimer::SessionRefresh => self.st_refresh(leg, now),
+            LegTimer::Rel1xxRetransmit => self.rel_retransmit(leg, now),
+            LegTimer::Rel1xxGiveUp => self.rel_give_up(leg, now),
+            LegTimer::FailoverProbe => self.failover_probe(leg, now),
+            LegTimer::ReferGuard => self.refer_guard(leg),
+            LegTimer::ReferAnswer => self.refer_answer_timeout(leg, now),
+            LegTimer::SessionExpire => self.st_expired(leg, now),
             LegTimer::UasAnswer => {
                 if leg.role == Role::Uas && matches!(leg.phase, Phase::Calling | Phase::Early) {
                     let cause = Cause::sip(CauseKind::Timeout, 480, "Temporarily Unavailable").with_detail("application did not answer");
@@ -1118,7 +1321,7 @@ impl UaEngine {
 
     fn on_cancel(&mut self, tid: TxnId, req: &SipMessage, key: ServerKey, now: u64) {
         let inv = ServerKey { method: Method::Invite, ..key };
-        let Some(&itid) = self.server_keys.get(&inv) else {
+        let Some(itid) = self.server_keys.get(&inv).copied().or_else(|| self.lenient_invite(req)) else {
             self.reply_simple(tid, 481, None, &[], now);
             return;
         };
@@ -1136,6 +1339,21 @@ impl UaEngine {
             let cause = Cause::sip(CauseKind::Cancelled, 487, "Request Terminated").with_reason_header(reason.as_deref());
             s.terminate(l, cause);
         });
+    }
+
+    /// With `lenient_matching`: the INVITE server transaction a request with
+    /// a non-matching branch belongs to (same Call-ID, From tag, CSeq
+    /// number and top-Via sent-by as the leg's INVITE).
+    fn lenient_invite(&self, req: &SipMessage) -> Option<TxnId> {
+        if !self.cfg.lenient_matching {
+            return None;
+        }
+        let key = (req.call_id()?.to_string(), req.from_tag()?, req.cseq()?.0);
+        let leg = self.legs.get(self.merged.get(&key)?)?;
+        let itid = leg.invite_txn?;
+        let inv = &self.txns.get(&itid)?.txn.request;
+        let same_sender = inv.top_via().map(|v| v.sent_by()) == req.top_via().map(|v| v.sent_by());
+        same_sender.then_some(itid)
     }
 
     fn on_new_invite(&mut self, tid: TxnId, req: SipMessage, src: Dest, now: u64) {
@@ -1156,17 +1374,38 @@ impl UaEngine {
         let call_id = req.call_id().unwrap_or_default().to_string();
         let cseq = req.cseq().map_or(0, |c| c.0);
         let mkey = (call_id.clone(), from_tag.clone(), cseq);
+        if let Some(itid) = self.lenient_invite(&req) {
+            // The same client resent its INVITE with another branch: answer
+            // it like a retransmission, from the original transaction.
+            self.remove_txn(tid);
+            let dest = response_dest(&req, src);
+            if let Some(r) = self.txns.get(&itid).and_then(|e| e.txn.last_response()) {
+                self.send_raw(dest, r, None);
+            }
+            return;
+        }
         if self.merged.contains_key(&mkey) {
             // RFC 3261 §8.2.2.2: the same request arrived over another path.
             let tag = self.token();
             self.reply_simple(tid, 482, Some(&tag), &[], now);
             return;
         }
-        let required = req.values("Require");
-        if !required.is_empty() {
-            self.reply_simple(tid, 420, None, &[("Unsupported", required.join(", "))], now);
+        let unsupported: Vec<String> = req.values("Require").into_iter().filter(|t| !SUPPORTED.iter().any(|s| t.eq_ignore_ascii_case(s))).collect();
+        if !unsupported.is_empty() {
+            self.reply_simple(tid, 420, None, &[("Unsupported", unsupported.join(", "))], now);
             return;
         }
+        if req.header("Session-Expires").and_then(session_timer::parse_se).is_some_and(|(v, _)| v < self.cfg.min_se) {
+            self.reply_simple(tid, 422, None, &[("Min-SE", self.cfg.min_se.to_string())], now);
+            return;
+        }
+        let replaces = match self.match_replaces(&req) {
+            Ok(r) => r,
+            Err(code) => {
+                self.reply_simple(tid, code, None, &[], now);
+                return;
+            }
+        };
         let ruri = req.uri().unwrap_or_default().to_string();
         let secure = parse_uri(ruri.as_bytes()).is_some_and(|u| u.is_sips());
         if secure && !src.proto.is_tls() {
@@ -1236,11 +1475,21 @@ impl UaEngine {
             overloaded: false,
             merged_key: Some(mkey.clone()),
             dialog_tags: Vec::new(),
+            ext: LegExt::default(),
         };
         if let Some(e) = self.txns.get_mut(&tid) {
             e.purpose = Purpose::Invite(id);
         }
         self.merged.insert(mkey, id);
+        // The Min-SE check above already answered 422 where needed.
+        let _ = self.st_on_request(&mut leg, &req);
+        leg.ext.rel.peer = if req.has_option("Require", "100rel") {
+            PeerRel::Required
+        } else if req.has_option("Supported", "100rel") {
+            PeerRel::Supported
+        } else {
+            PeerRel::No
+        };
         self.register_dialog(&mut leg, &from_tag);
         self.reply_simple(tid, 100, None, &[], now);
         let at = now.saturating_add(self.cfg.uas_answer_timeout_ms);
@@ -1253,6 +1502,14 @@ impl UaEngine {
             source: src,
             headers: req.headers.clone(),
             sdp: offer,
+            replaces,
+            trusted_source: self.cfg.trust.is_trusted(src.addr.ip()),
+            asserted_identity: if self.cfg.trust.is_trusted(src.addr.ip()) { req.values("P-Asserted-Identity") } else { Vec::new() },
+            privacy: req
+                .header_lines("Privacy")
+                .flat_map(|v| v.split(';').map(|t| t.trim().to_string()).collect::<Vec<_>>())
+                .filter(|t| !t.is_empty())
+                .collect(),
         };
         self.emit(&mut leg, None, UaEvent::IncomingInvite(ev));
         self.legs.insert(id, leg);
@@ -1283,6 +1540,7 @@ impl UaEngine {
     }
 
     fn uas_final(&mut self, leg: &mut Leg, code: u16, reason: Option<&str>, headers: Vec<Header>, reason_hdr: Option<String>, now: u64) {
+        Self::rel_finish(leg);
         let Some(tid) = leg.invite_txn else { return };
         let Some(req) = self.txns.get(&tid).map(|e| e.txn.request.clone()) else { return };
         let mut r = self.build_response(&req, code, reason, Some(&leg.local_tag));
@@ -1364,12 +1622,19 @@ impl UaEngine {
             Method::Update => self.on_update(leg, tid, req, now),
             Method::Info => {
                 self.reply_simple(tid, 200, None, &[], now);
-                let ev = InfoEvent { content_type: req.content_type().map(str::to_string), body: req.body.clone(), headers: req.headers.clone() };
+                let ev = InfoEvent {
+                    content_type: req.content_type().map(str::to_string),
+                    body: req.body.clone(),
+                    headers: req.headers.clone(),
+                    dtmf: crate::dtmf::parse_info(req.content_type(), &req.body),
+                    rtp_dtmf_negotiated: leg.ext.rtp_dtmf,
+                };
                 self.emit(leg, None, UaEvent::Info(ev));
             }
             Method::Options => self.reply_simple(tid, 200, None, &[("Accept", "application/sdp".into())], now),
-            // We never send reliable provisionals.
-            Method::Prack => self.reply_simple(tid, 481, None, &[], now),
+            Method::Prack => self.on_prack(leg, tid, &req, now),
+            Method::Refer => self.on_refer(leg, tid, &req, now),
+            Method::Notify => self.on_notify(leg, tid, &req, now),
             _ => self.reply_simple(tid, 501, None, &[], now),
         }
     }
@@ -1403,7 +1668,9 @@ impl UaEngine {
             || leg.server_update.is_some()
             || leg.pending_2xx.is_some()
             || leg.ack_wait.is_some();
-        if busy || leg.phase != Phase::Confirmed {
+        // RFC 3311: an early dialog may renegotiate once its first exchange completed.
+        let phase_ok = leg.phase == Phase::Confirmed || (leg.phase == Phase::Early && leg.negotiated && leg.ext.rel.hold.is_none());
+        if busy || !phase_ok {
             let ra = self.glare_retry_after();
             self.reply_simple(tid, 500, None, &[("Retry-After", ra)], now);
             return false;
@@ -1416,6 +1683,10 @@ impl UaEngine {
             e.purpose = Purpose::ReInvite(leg.id, None);
         }
         if !self.offer_allowed(leg, tid, now) {
+            return;
+        }
+        if let Err(min) = self.st_on_request(leg, &req) {
+            self.reply_simple(tid, 422, None, &[("Min-SE", min.to_string())], now);
             return;
         }
         let offer = if req.body.is_empty() {
@@ -1441,15 +1712,25 @@ impl UaEngine {
             e.purpose = Purpose::Update(leg.id, None);
         }
         if req.body.is_empty() {
-            // Target refresh only (RFC 3311 §5.2).
+            // Target / session refresh only (RFC 3311 §5.2, RFC 4028).
+            if let Err(min) = self.st_on_request(leg, &req) {
+                self.reply_simple(tid, 422, None, &[("Min-SE", min.to_string())], now);
+                return;
+            }
             if let Some(c) = req.contact_uri() {
                 leg.remote_target = c;
             }
-            let contact = format!("<{}>", leg.local_contact);
-            self.reply_simple(tid, 200, None, &[("Contact", contact)], now);
+            let mut r = self.build_response(&req, 200, None, None);
+            r.push_header("Contact", format!("<{}>", leg.local_contact));
+            self.st_response_headers(leg, &mut r, now);
+            self.reply(tid, r, now);
             return;
         }
         if !self.offer_allowed(leg, tid, now) {
+            return;
+        }
+        if let Err(min) = self.st_on_request(leg, &req) {
+            self.reply_simple(tid, 422, None, &[("Min-SE", min.to_string())], now);
             return;
         }
         if !req.sdp().is_some_and(sdp::is_valid) {
@@ -1480,6 +1761,7 @@ impl UaEngine {
                     Some(b) => {
                         leg.negotiated = true;
                         leg.stable_generation = leg.generation;
+                        leg.ext.local_sdp = Some(b.clone());
                         b
                     }
                     None => sdp::reject_all(offer.as_deref().unwrap_or_default()),
@@ -1499,7 +1781,9 @@ impl UaEngine {
                         if let Some(c) = req.contact_uri() {
                             leg.remote_target = c;
                         }
-                        let r = self.uas_dialog_response(leg, &req, 200, None, &[], Some(&b));
+                        let mut r = self.uas_dialog_response(leg, &req, 200, None, &[], Some(&b));
+                        self.st_response_headers(leg, &mut r, now);
+                        leg.ext.local_sdp = Some(b);
                         let cseq = req.cseq().map_or(0, |c| c.0);
                         let dest = self.txns.get(&tid).map(|e| e.txn.dest);
                         let bytes: Arc<[u8]> = r.to_bytes().into();
@@ -1516,6 +1800,7 @@ impl UaEngine {
                     }
                     None => {
                         leg.oa = Oa::Stable;
+                        leg.ext.st.pending = None;
                         self.reply_simple(tid, 488, None, &[], now);
                     }
                 }
@@ -1528,15 +1813,21 @@ impl UaEngine {
                         let Some(req) = self.txns.get(&tid).map(|e| e.txn.request.clone()) else { return };
                         let mut r = self.build_response(&req, 200, None, None);
                         r.push_header("Contact", format!("<{}>", leg.local_contact));
+                        self.st_response_headers(leg, &mut r, now);
                         r.push_header("Content-Type", "application/sdp");
+                        leg.ext.local_sdp = Some(b.clone());
                         r.body = b;
                         self.reply(tid, r, now);
                         leg.stable_generation = leg.generation;
                     }
-                    None => self.reply_simple(tid, 488, None, &[], now),
+                    None => {
+                        leg.ext.st.pending = None;
+                        self.reply_simple(tid, 488, None, &[], now);
+                    }
                 }
             }
-            OfferVia::Invite | OfferVia::OurTwoXx => {}
+            OfferVia::TheirReliable1xx => self.answer_reliable_offer(leg, offer, sdp_body, now),
+            OfferVia::Invite | OfferVia::OurTwoXx | OfferVia::OurReliable1xx => {}
         }
     }
 
@@ -1574,6 +1865,12 @@ impl UaEngine {
                         s.terminate(l, cause);
                     });
                 }
+            }
+            Purpose::Refresh(leg) => {
+                self.with_leg(leg, now, |s, l| s.refresh_response(l, tid, &resp, now));
+            }
+            Purpose::Refer(leg, op) => {
+                self.with_leg(leg, now, |s, l| s.refer_response(l, tid, op, &resp, now));
             }
             Purpose::Info(leg, op) => {
                 let Some(code) = resp.status().filter(|c| *c >= 200) else { return };
@@ -1661,10 +1958,15 @@ impl UaEngine {
         }
         let Some(e) = self.txns.get(&tid) else { return };
         let (invite, dest) = (e.txn.request.clone(), e.txn.dest);
+        self.stats.forks_terminated = self.stats.forks_terminated.saturating_add(1);
         // A delayed-offer 2xx carries an offer: the ACK must answer it.
         let body = if invite.sdp().is_none() { resp.sdp().map(sdp::reject_all) } else { None };
         let ack = self.ack_for(&invite, resp, body);
-        if let Some(b) = self.send_with_via(ack, resp, dest) {
+        // Remember the ACK for retransmissions, within the same bound as
+        // early dialogs (beyond it a retransmitted 2xx is ACKed and BYEd again).
+        if let Some(b) = self.send_with_via(ack, resp, dest)
+            && leg.killed.len() < self.cfg.max_early_dialogs
+        {
             leg.killed.push((tag, b, dest));
         }
         let cseq = invite.cseq().map_or(1, |c| c.0).saturating_add(1);
@@ -1687,21 +1989,57 @@ impl UaEngine {
             return;
         }
         let Some(code) = resp.status() else { return };
+        leg.ext.fo.responded = true;
+        if (101..300).contains(&code) {
+            leg.ext.fo.reached = true;
+        }
         let tag = resp.to_tag();
         let status = SipStatus { code, reason: resp.reason().unwrap_or_default().to_string() };
         if code < 200 {
             if code > 100 {
-                if let Some(t) = tag.clone() {
-                    if !leg.early.contains(&t) {
-                        leg.early.push(t.clone());
+                let rseq = prack::rseq_of(resp);
+                if let Some(t) = tag.as_deref() {
+                    if !self.note_early_dialog(leg, t, resp) {
+                        return;
                     }
-                    self.register_dialog(leg, &t);
+                    if let Some(n) = rseq
+                        && !Self::accept_rseq(leg, t, n)
+                    {
+                        // A retransmission (already PRACKed) or out of order.
+                        return;
+                    }
                 }
-                if let (Oa::LocalOffer(OfferVia::Invite, _), Some(a)) = (leg.oa, resp.sdp()) {
-                    leg.early_answer = Some(a.to_vec());
-                    leg.oa = Oa::Stable;
-                    leg.negotiated = true;
-                    leg.stable_generation = leg.generation;
+                let invite_cseq = resp.cseq().map_or(0, |c| c.0);
+                let prack_now = rseq.is_some() && tag.is_some();
+                match (leg.oa, resp.sdp().filter(|b| sdp::is_valid(b))) {
+                    (Oa::LocalOffer(OfferVia::Invite, _), Some(a)) => {
+                        leg.early_answer = Some(a.to_vec());
+                        leg.oa = Oa::Stable;
+                        leg.negotiated = true;
+                        leg.ext.rel.negotiated_early = rseq.is_some();
+                        leg.stable_generation = leg.generation;
+                    }
+                    // Delayed offer: an offer in a reliable 1xx, answered in the PRACK.
+                    (Oa::Stable, Some(o)) if !leg.negotiated && prack_now && leg.cancel == CancelState::None => {
+                        leg.generation = leg.generation.saturating_add(1);
+                        leg.oa = Oa::RemoteOffer(OfferVia::TheirReliable1xx);
+                        leg.remote_offer = Some(o.to_vec());
+                        leg.ext.rel.hold = Some((tag.clone().unwrap_or_default(), rseq.unwrap_or_default(), invite_cseq));
+                        let deadline = now.saturating_add(self.cfg.answer_timeout_ms);
+                        self.arm_leg(leg, LegTimer::AnswerDeadline, deadline);
+                        if leg.phase == Phase::Calling {
+                            leg.phase = Phase::Early;
+                        }
+                        let op = leg.origin_op;
+                        self.emit(leg, op, UaEvent::Provisional(ProvisionalEvent { status, remote_tag: tag, sdp: Some(o.to_vec()) }));
+                        let ev = RemoteOfferEvent { kind: OfferKind::ReliableProvisional, sdp: Some(o.to_vec()), deadline };
+                        self.emit(leg, op, UaEvent::RemoteOffer(ev));
+                        return;
+                    }
+                    _ => {}
+                }
+                if prack_now && let (Some(t), Some(n)) = (tag.as_deref(), rseq) {
+                    self.send_prack(leg, t, n, invite_cseq, None, now);
                 }
                 if leg.phase == Phase::Calling {
                     leg.phase = Phase::Early;
@@ -1743,8 +2081,17 @@ impl UaEngine {
         if matches!(code, 401 | 407) && self.retry_with_auth(leg, tid, resp, now) {
             return;
         }
+        if code == 422 && leg.cancel == CancelState::None && self.retry_after_422(leg, tid, resp, now) {
+            return;
+        }
+        if code == 503 && self.failover(leg, tid, now) {
+            return;
+        }
+        if (300..400).contains(&code) && self.follow_redirect(leg, resp, now) {
+            return;
+        }
         for t in std::mem::take(&mut leg.early) {
-            self.unregister_dialog(leg, &t);
+            self.unregister_dialog(leg, &t.tag);
         }
         let reason = resp.header("Reason");
         let cause = if leg.cancel == CancelState::Sent && code == 487 {
@@ -1752,7 +2099,11 @@ impl UaEngine {
         } else if matches!(code, 401 | 407) {
             Cause::sip(CauseKind::AuthFailed, code, status.reason.clone())
         } else {
-            Cause::sip(CauseKind::SipResponse, code, status.reason.clone()).with_reason_header(reason)
+            let mut c = Cause::sip(CauseKind::SipResponse, code, status.reason.clone()).with_reason_header(reason);
+            if (300..400).contains(&code) {
+                c.contacts = redirect::redirect_contacts(resp);
+            }
+            c
         };
         let op = leg.origin_op;
         // A 487 to our own CANCEL ends the leg as asked: not a failure.
@@ -1774,8 +2125,8 @@ impl UaEngine {
         rr.reverse();
         leg.route_set = rr;
         for t in std::mem::take(&mut leg.early) {
-            if t != tag {
-                self.unregister_dialog(leg, &t);
+            if t.tag != tag {
+                self.unregister_dialog(leg, &t.tag);
             }
         }
         self.register_dialog(leg, &tag);
@@ -1783,6 +2134,7 @@ impl UaEngine {
         leg.disarm(LegTimer::NoAnswer);
         // Only needed to resend the INVITE with credentials.
         leg.invite_template = None;
+        self.st_on_2xx(leg, resp, now);
         let cseq = self.txns.get(&tid).and_then(|e| e.txn.request.cseq()).map_or(leg.local_cseq, |c| c.0);
         let op = leg.origin_op;
         let answer = resp.sdp().map(<[u8]>::to_vec);
@@ -1824,18 +2176,24 @@ impl UaEngine {
         if leg.auth_attempts >= self.cfg.max_auth_attempts || leg.cancel != CancelState::None || leg.phase == Phase::Terminating {
             return false;
         }
-        let Some(mut req) = leg.invite_template.clone() else { return false };
-        let uri = req.uri().unwrap_or_default().to_string();
+        let Some(uri) = leg.invite_template.as_ref().map(|r| r.uri().unwrap_or_default().to_string()) else { return false };
         let cnonce = self.token();
         let Some((hname, hval)) = auth::authorize(resp, &creds, "INVITE", &uri, &cnonce) else { return false };
-        let Some(cseq) = leg.local_cseq.checked_add(1).filter(|c| *c < 1 << 31) else { return false };
         leg.auth_attempts = leg.auth_attempts.saturating_add(1);
+        self.resend_invite(leg, tid, now, |m| m.set_header(hname, hval))
+    }
+
+    /// Send the leg's INVITE again (new CSeq and branch) after editing it:
+    /// digest credentials, a larger Session-Expires.
+    fn resend_invite(&mut self, leg: &mut Leg, tid: TxnId, now: u64, edit: impl FnOnce(&mut SipMessage)) -> bool {
+        let Some(mut req) = leg.invite_template.clone() else { return false };
+        let Some(cseq) = leg.local_cseq.checked_add(1).filter(|c| *c < 1 << 31) else { return false };
         leg.local_cseq = cseq;
         req.set_header("CSeq", format!("{cseq} INVITE"));
-        req.set_header(hname, hval);
+        edit(&mut req);
         leg.invite_template = Some(req.clone());
         for t in std::mem::take(&mut leg.early) {
-            self.unregister_dialog(leg, &t);
+            self.unregister_dialog(leg, &t.tag);
         }
         leg.phase = Phase::Calling;
         let dest = leg.invite_dest.or_else(|| self.txns.get(&tid).map(|e| e.txn.dest));
@@ -1855,11 +2213,17 @@ impl UaEngine {
 
     /// An in-dialog request with our dialog state (RFC 3261 §12.2.1.1).
     fn dialog_request(&self, leg: &Leg, method: Method, cseq: u32) -> SipMessage {
-        let (ruri, routes) = route_request(&leg.remote_target, &leg.route_set);
+        // A UAC leg in a single early dialog talks on that dialog.
+        let early = if leg.remote_tag.is_none() { leg.early.first().filter(|_| leg.early.len() == 1) } else { None };
+        let (target, route_set, remote_hdr) = match early {
+            Some(e) => (&e.remote_target, &e.route_set, &e.remote_hdr),
+            None => (&leg.remote_target, &leg.route_set, &leg.remote_hdr),
+        };
+        let (ruri, routes) = route_request(target, route_set);
         let mut m = SipMessage::request(method.clone(), ruri);
         m.push_header("Max-Forwards", "70");
         m.push_header("From", leg.local_hdr.as_str());
-        m.push_header("To", leg.remote_hdr.as_str());
+        m.push_header("To", remote_hdr.as_str());
         m.push_header("Call-ID", leg.call_id.as_str());
         m.push_header("CSeq", format!("{cseq} {method}"));
         for r in routes {
@@ -1946,6 +2310,13 @@ impl UaEngine {
                     }
                     Purpose::ReInvite(_, Some(_)) => leg.client_reinvite = Some(id),
                     Purpose::Update(_, Some(_)) => leg.client_update = Some(id),
+                    Purpose::Refer(_, op) => Self::refer_started(leg, id, op),
+                    Purpose::Refresh(_) => {
+                        leg.ext.st.refreshing = Some(id);
+                        if self.txns.get(&id).is_some_and(|e| e.txn.request.method() == Some(&Method::Invite)) {
+                            leg.client_reinvite = Some(id);
+                        }
+                    }
                     _ => {}
                 }
                 Ok(())
@@ -2070,6 +2441,8 @@ impl UaEngine {
                 Some(a) => {
                     leg.oa = Oa::Stable;
                     leg.stable_generation = leg.generation;
+                    leg.ext.local_sdp = leg.ext.offered_sdp.take().or(leg.ext.local_sdp.take());
+                    self.st_on_2xx(leg, resp, now);
                     self.emit(leg, Some(op), UaEvent::Completed(CompletedEvent { status, sdp: Some(a.to_vec()) }));
                 }
                 None => {
@@ -2108,6 +2481,8 @@ impl UaEngine {
             Some(a) => {
                 leg.oa = Oa::Stable;
                 leg.stable_generation = leg.generation;
+                leg.ext.local_sdp = leg.ext.offered_sdp.take().or(leg.ext.local_sdp.take());
+                self.st_on_2xx(leg, resp, now);
                 self.emit(leg, Some(op), UaEvent::Completed(CompletedEvent { status, sdp: Some(a.to_vec()) }));
             }
             None => {
@@ -2118,12 +2493,15 @@ impl UaEngine {
         }
     }
 
-    fn on_txn_failure(&mut self, _tid: TxnId, purpose: Purpose, kind: CauseKind, now: u64) {
+    fn on_txn_failure(&mut self, tid: TxnId, purpose: Purpose, kind: CauseKind, now: u64) {
         let cause = if kind == CauseKind::Timeout { Cause::sip(kind, 408, "Request Timeout") } else { Cause::new(kind) };
         match purpose {
             Purpose::Invite(leg) => {
                 self.with_leg(leg, now, |s, l| {
                     if l.role == Role::Uac && matches!(l.phase, Phase::Calling | Phase::Early) {
+                        if l.invite_txn != Some(tid) || s.failover(l, tid, now) {
+                            return;
+                        }
                         let op = l.origin_op;
                         if l.cancel != CancelState::None {
                             let c = l.cancel_cause.clone().unwrap_or(cause);
@@ -2149,6 +2527,15 @@ impl UaEngine {
                 self.with_leg(leg, now, |s, l| {
                     let c = l.bye_cause.clone().unwrap_or(cause);
                     s.terminate(l, c);
+                });
+            }
+            Purpose::Refresh(leg) => {
+                self.with_leg(leg, now, |s, l| s.refresh_failed(l, cause, now));
+            }
+            Purpose::Refer(leg, op) => {
+                self.with_leg(leg, now, |s, l| {
+                    l.ext.refer = ReferState::default();
+                    s.emit(l, Some(op), UaEvent::Failed(FailureEvent { cause, leg_failed: false, retry_after_ms: None }));
                 });
             }
             Purpose::Info(leg, op) => {
@@ -2187,7 +2574,7 @@ impl UaEngine {
     fn leg_command(&mut self, leg: &mut Leg, op: OperationId, cmd: UaCommand, now: u64) -> Result<(), CommandError> {
         match cmd {
             UaCommand::Originate(_) => Err(CommandError::InvalidState("originate addresses no leg")),
-            UaCommand::Provisional(r) => self.cmd_provisional(leg, r, now),
+            UaCommand::Provisional(r) => self.cmd_provisional(leg, op, r, now),
             UaCommand::Accept(r) => self.cmd_accept(leg, op, r, now),
             UaCommand::Reject(r) => {
                 if leg.role != Role::Uas || !matches!(leg.phase, Phase::Calling | Phase::Early) {
@@ -2235,6 +2622,17 @@ impl UaEngine {
                 let id = leg.id;
                 self.dispatch_leg_request(leg, m, Purpose::Info(id, op), None, now)
             }
+            UaCommand::Refer(r) => self.cmd_refer(leg, op, r, now),
+            UaCommand::RespondToRefer(r) => self.cmd_respond_refer(leg, r, now),
+            UaCommand::NotifyRefer(r) => self.cmd_notify_refer(leg, r, now),
+            UaCommand::SendDtmf(r) => {
+                if !crate::dtmf::is_digit(r.dtmf.digit) {
+                    return Err(CommandError::InvalidArgument("DTMF digit".into()));
+                }
+                let body = crate::dtmf::relay_body(&r.dtmf);
+                let info = InfoRequest { leg: r.leg, content_type: "application/dtmf-relay".into(), body, headers: Vec::new() };
+                self.leg_command(leg, op, UaCommand::SendInfo(info), now)
+            }
             UaCommand::RespondToOffer(r) => {
                 if !matches!(leg.oa, Oa::RemoteOffer(_)) {
                     return Err(CommandError::InvalidState("no remote offer outstanding"));
@@ -2250,6 +2648,9 @@ impl UaEngine {
                 if via == Oa::RemoteOffer(OfferVia::TheirTwoXx) && r.sdp.is_none() {
                     let cause = Cause::new(CauseKind::Local).with_detail("offer in 2xx rejected by the application");
                     self.send_bye(leg, None, cause, now);
+                }
+                if via == Oa::RemoteOffer(OfferVia::TheirReliable1xx) && r.sdp.is_none() {
+                    self.cancel_leg(leg, None, Cause::new(CauseKind::Local).with_detail("offer in a reliable provisional rejected by the application"), now);
                 }
                 Ok(())
             }
@@ -2282,7 +2683,7 @@ impl UaEngine {
         }
     }
 
-    fn cmd_provisional(&mut self, leg: &mut Leg, r: ProvisionalRequest, now: u64) -> Result<(), CommandError> {
+    fn cmd_provisional(&mut self, leg: &mut Leg, op: OperationId, r: ProvisionalRequest, now: u64) -> Result<(), CommandError> {
         if leg.role != Role::Uas || !matches!(leg.phase, Phase::Calling | Phase::Early) {
             return Err(CommandError::InvalidState("provisional needs an unanswered inbound leg"));
         }
@@ -2290,29 +2691,7 @@ impl UaEngine {
             return Err(CommandError::InvalidArgument("provisional code must be 101..=199".into()));
         }
         check_headers(&r.headers)?;
-        if let Some(b) = &r.sdp {
-            check_sdp(b)?;
-            match leg.oa {
-                Oa::RemoteOffer(OfferVia::Invite) => {}
-                Oa::Stable if leg.negotiated => {}
-                // An offer is only allowed in a reliable provisional (RFC 3262), which we don't send.
-                _ => return Err(CommandError::InvalidState("early SDP needs an offer in the INVITE")),
-            }
-        }
-        let tid = leg.invite_txn.ok_or(CommandError::InvalidState("no INVITE"))?;
-        let req = self.txns.get(&tid).map(|e| e.txn.request.clone()).ok_or(CommandError::InvalidState("INVITE transaction gone"))?;
-        let reason = r.reason.filter(|x| is_safe_value(x));
-        let resp = self.uas_dialog_response(leg, &req, r.code, reason.as_deref(), &r.headers, r.sdp.as_deref());
-        self.reply(tid, resp, now);
-        if let Some(b) = r.sdp {
-            leg.early_answer = Some(b);
-            leg.remote_offer = None;
-            leg.oa = Oa::Stable;
-            leg.negotiated = true;
-            leg.stable_generation = leg.generation;
-        }
-        leg.phase = Phase::Early;
-        Ok(())
+        self.uas_provisional(leg, op, r, now)
     }
 
     fn cmd_accept(&mut self, leg: &mut Leg, op: OperationId, r: AcceptRequest, now: u64) -> Result<(), CommandError> {
@@ -2323,23 +2702,36 @@ impl UaEngine {
         if let Some(b) = &r.sdp {
             check_sdp(b)?;
         }
+        if leg.ext.rel.pending_offer() {
+            // RFC 3262 §3: no 2xx before the PRACK answering our offer.
+            return Err(CommandError::OfferPending);
+        }
         let (body, next_oa) = match leg.oa {
             Oa::RemoteOffer(OfferVia::Invite) => {
-                (r.sdp.ok_or(CommandError::InvalidArgument("the INVITE has an offer: accept needs the answer".into()))?, Oa::Stable)
+                (Some(r.sdp.ok_or(CommandError::InvalidArgument("the INVITE has an offer: accept needs the answer".into()))?), Oa::Stable)
             }
+            // Completed in a reliable 1xx / PRACK: the 2xx needs no SDP.
+            Oa::Stable if leg.negotiated && leg.ext.rel.negotiated_early => (r.sdp, Oa::Stable),
             Oa::Stable if leg.negotiated => {
-                (r.sdp.or_else(|| leg.early_answer.clone()).ok_or(CommandError::InvalidArgument("answer missing".into()))?, Oa::Stable)
+                (Some(r.sdp.or_else(|| leg.early_answer.clone()).ok_or(CommandError::InvalidArgument("answer missing".into()))?), Oa::Stable)
             }
-            Oa::Stable => {
-                (r.sdp.ok_or(CommandError::InvalidArgument("delayed offer: accept needs our offer".into()))?, Oa::LocalOffer(OfferVia::OurTwoXx, Some(op)))
-            }
+            Oa::Stable => (
+                Some(r.sdp.ok_or(CommandError::InvalidArgument("delayed offer: accept needs our offer".into()))?),
+                Oa::LocalOffer(OfferVia::OurTwoXx, Some(op)),
+            ),
             _ => return Err(CommandError::OfferPending),
         };
+        Self::rel_finish(leg);
         let tid = leg.invite_txn.ok_or(CommandError::InvalidState("no INVITE"))?;
         let (req, dest) = self.txns.get(&tid).map(|e| (e.txn.request.clone(), e.txn.dest)).ok_or(CommandError::InvalidState("INVITE transaction gone"))?;
-        let resp = self.uas_dialog_response(leg, &req, 200, None, &r.headers, Some(&body));
+        let mut resp = self.uas_dialog_response(leg, &req, 200, None, &r.headers, body.as_deref());
+        resp.push_header("Supported", SUPPORTED.join(", "));
+        self.st_response_headers(leg, &mut resp, now);
         let bytes: Arc<[u8]> = resp.to_bytes().into();
         self.reply(tid, resp, now);
+        if body.is_some() {
+            leg.ext.local_sdp = body;
+        }
         leg.remote_offer = None;
         leg.early_answer = None;
         if next_oa == Oa::Stable {
@@ -2358,8 +2750,13 @@ impl UaEngine {
     }
 
     fn cmd_negotiate(&mut self, leg: &mut Leg, op: OperationId, r: NegotiateRequest, now: u64) -> Result<(), CommandError> {
-        if leg.phase != Phase::Confirmed {
-            return Err(CommandError::InvalidState("negotiate needs a confirmed dialog"));
+        let early_update = leg.phase == Phase::Early
+            && r.method == NegotiateMethod::Update
+            && leg.negotiated
+            && leg.ext.rel.negotiated_early
+            && (leg.role == Role::Uas || leg.early.len() == 1);
+        if leg.phase != Phase::Confirmed && !early_update {
+            return Err(CommandError::InvalidState("negotiate needs a confirmed dialog (or UPDATE in an early dialog after a reliable exchange)"));
         }
         check_sdp(&r.sdp)?;
         let busy = leg.oa != Oa::Stable
@@ -2379,7 +2776,10 @@ impl UaEngine {
         let cseq = Self::next_cseq(leg).ok_or(CommandError::InvalidState("CSeq space exhausted"))?;
         let mut m = self.dialog_request(leg, method, cseq);
         m.push_header("Allow", ALLOW);
+        m.push_header("Supported", SUPPORTED.join(", "));
+        self.st_request_headers(leg, &mut m);
         m.push_header("Content-Type", "application/sdp");
+        leg.ext.offered_sdp = Some(r.sdp.clone());
         m.body = r.sdp;
         let id = leg.id;
         let purpose = if via == OfferVia::ReInvite { Purpose::ReInvite(id, Some(op)) } else { Purpose::Update(id, Some(op)) };
@@ -2418,6 +2818,13 @@ impl UaEngine {
             return Err(CommandError::InvalidArgument("contact".into()));
         }
         check_headers(&o.headers)?;
+        let bad_identity = |a: &String| !is_safe_value(a) || (parse_uri(uri_of(a).as_bytes()).is_none());
+        if o.asserted_identity.iter().any(bad_identity) {
+            return Err(CommandError::InvalidArgument("P-Asserted-Identity".into()));
+        }
+        if o.privacy.iter().any(|p| !crate::identity::PRIVACY_VALUES.iter().any(|v| v.eq_ignore_ascii_case(p))) {
+            return Err(CommandError::InvalidArgument("Privacy".into()));
+        }
         if let Some(b) = &o.sdp {
             check_sdp(b)?;
         }
@@ -2477,14 +2884,29 @@ impl UaEngine {
             overloaded: false,
             merged_key: None,
             dialog_tags: Vec::new(),
+            ext: LegExt::default(),
         };
         let mut inv = self.dialog_request(&leg, Method::Invite, 1);
         inv.push_header("Allow", ALLOW);
+        inv.push_header("Supported", SUPPORTED.join(", "));
+        self.st_request_headers(&leg, &mut inv);
+        leg.ext.local_sdp = o.sdp.clone();
+        leg.ext.fo.contact_generated = o.contact.is_none();
         if let Some(c) = &o.contact {
             inv.push_header("Contact", format!("<{c}>"));
         }
         for h in o.headers {
             inv.push_header(h.name, h.value);
+        }
+        if let Some(r) = &o.replaces {
+            inv.push_header("Replaces", r.to_header());
+            inv.push_header("Require", "replaces");
+        }
+        for a in &o.asserted_identity {
+            inv.push_header("P-Asserted-Identity", angle(a));
+        }
+        if !o.privacy.is_empty() {
+            inv.push_header("Privacy", o.privacy.join(";"));
         }
         if let Some(b) = o.sdp {
             inv.push_header("Content-Type", "application/sdp");
@@ -2503,7 +2925,7 @@ impl UaEngine {
                 Ok(Accepted { op, leg: id })
             }
             Err(e) => {
-                self.cleanup(&mut leg);
+                self.cleanup(&mut leg, now);
                 Err(e)
             }
         }

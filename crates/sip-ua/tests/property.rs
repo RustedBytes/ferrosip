@@ -57,7 +57,15 @@ fn run_seed(seed: u64) {
     let mut a_cancel_at = if app.chance(25) { Some(net.now + app.below(3_000)) } else { None };
     let answer_at = net.now + app.below(4_000);
     let reject = app.chance(20);
+    // Early media: a 183 with SDP (sent reliably; an offer when the INVITE had none).
+    let early_media = app.chance(50);
     let renegotiate = app.chance(50);
+    // The callee transfers the caller; the caller's application answers the
+    // REFER, or never does, or hangs up while it is pending.
+    let refer = app.chance(30);
+    let refer_answer = app.below(3);
+    let mut referred = false;
+    let mut refer_answered = false;
     let mut renegotiated = false;
     let mut retried = false;
     let mut answered_offers = 0usize;
@@ -71,19 +79,20 @@ fn run_seed(seed: u64) {
         if b.is_none() {
             b = net.incoming_leg(1);
             if let Some(l) = b {
-                let _ = net.submit(1, UaCommand::Provisional(ProvisionalRequest { leg: l, code: 180, reason: None, sdp: None, headers: vec![] }));
+                let (code, body) = if early_media { (183, Some(sdp("early"))) } else { (180, None) };
+                let _ = net.submit(1, UaCommand::Provisional(ProvisionalRequest { leg: l, code, reason: None, sdp: body, headers: vec![] }));
             }
         }
         if let (Some(l), false) = (b, b_done)
             && net.now >= answer_at
         {
-            b_done = true;
             let cmd = if reject {
                 UaCommand::Reject(RejectRequest { leg: l, code: 486, reason: None, headers: vec![] })
             } else {
                 UaCommand::Accept(AcceptRequest { leg: l, sdp: Some(sdp("ans")), headers: vec![] })
             };
-            let _ = net.submit(1, cmd);
+            // Our offer in a reliable 183 must be PRACKed before the 2xx: try again later.
+            b_done = net.submit(1, cmd) != Err(CommandError::OfferPending);
         }
         if let Some(t) = a_cancel_at
             && net.now >= t
@@ -118,6 +127,27 @@ fn run_seed(seed: u64) {
         {
             retried = true;
             let _ = net.submit(0, UaCommand::Negotiate(NegotiateRequest { leg: a, method: NegotiateMethod::Update, sdp: sdp("re2") }));
+        }
+        if refer
+            && !referred
+            && let Some(l) = b
+            && net.engine(1).snapshot(l).is_some_and(|s| s.phase == Phase::Confirmed)
+        {
+            referred = true;
+            let _ = net.submit(1, UaCommand::Refer(ReferRequest { leg: l, refer_to: "<sip:carol@10.0.0.3>".into(), referred_by: None, headers: vec![] }));
+        }
+        if !refer_answered && net.has(0, |e| matches!(e, UaEvent::ReferRequested(_))) {
+            refer_answered = true;
+            match refer_answer {
+                0 => {
+                    let _ = net.submit(0, UaCommand::RespondToRefer(ReferResponse { leg: a, accept: true }));
+                    let _ = net.submit(0, UaCommand::NotifyRefer(ReferNotify { leg: a, code: 503, reason: None, last: true }));
+                }
+                1 => {
+                    let _ = net.submit(0, UaCommand::Hangup(HangupRequest { leg: a, reason: None, code: None }));
+                }
+                _ => {} // never answered: the engine's deadline answers 603
+            }
         }
         if net.now > 20_000 {
             break;

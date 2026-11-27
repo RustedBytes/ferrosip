@@ -1,0 +1,11 @@
+UPDATE sip:ua@127.0.0.1 SIP/2.0
+Via: SIP/2.0/UDP 127.0.0.2:5060;branch=z9hG4bKu1
+From: <sip:a@x>;tag=ft
+To: <sip:ua@x>;tag=TAG
+Call-ID: fz
+CSeq: 3 UPDATE
+Session-Expires: 90;refresher=uac
+Min-SE: 90
+Supported: timer
+Content-Length: 0
+

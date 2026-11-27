@@ -201,6 +201,11 @@ impl Txn {
         }
     }
 
+    /// The last response this server transaction sent.
+    pub fn last_response(&self) -> Option<Arc<[u8]>> {
+        self.last_response.clone()
+    }
+
     /// The final response this server transaction sent, if any.
     pub fn final_sent(&self) -> bool {
         matches!(self.state, State::Completed | State::Accepted | State::Confirmed | State::Terminated)

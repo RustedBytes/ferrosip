@@ -3,6 +3,15 @@
 //! addresses that no engine owns (hand-scripted peers).
 
 #![allow(dead_code, reason = "shared by several test files, each using a subset")]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    reason = "test helpers outside #[test] fns"
+)]
 
 use sip_ua::*;
 use std::collections::VecDeque;
@@ -36,6 +45,9 @@ impl Packet {
 /// Decide a packet's fate: how many copies to deliver (0 = lost).
 pub type Rule = Box<dyn FnMut(&Packet) -> usize>;
 
+/// Answers the engines' DNS requests (default: every lookup fails).
+pub type Resolve = Box<dyn FnMut(&ResolveRequest) -> Result<Vec<Dest>, String>>;
+
 pub struct Net {
     pub now: u64,
     pub nodes: Vec<Node>,
@@ -45,6 +57,7 @@ pub struct Net {
     /// Every packet an engine sent (before loss/duplication).
     pub log: Vec<Packet>,
     pub rule: Rule,
+    pub resolver: Resolve,
     /// Extra random delay per packet (reordering): (rng, max ms).
     pub jitter: Option<(SeededEntropy, u64)>,
 }
@@ -63,7 +76,16 @@ pub fn sdp(tag: &str) -> Vec<u8> {
 
 impl Net {
     pub fn new() -> Self {
-        Self { now: 0, nodes: Vec::new(), inflight: VecDeque::new(), captured: Vec::new(), log: Vec::new(), rule: Box::new(|_| 1), jitter: None }
+        Self {
+            now: 0,
+            nodes: Vec::new(),
+            inflight: VecDeque::new(),
+            captured: Vec::new(),
+            log: Vec::new(),
+            rule: Box::new(|_| 1),
+            resolver: Box::new(|r| Err(format!("no DNS in tests: {}", r.host))),
+            jitter: None,
+        }
     }
 
     pub fn add(&mut self, a: &str, seed: u64) -> usize {
@@ -116,9 +138,9 @@ impl Net {
                     }
                 }
                 while let Some(r) = self.nodes[i].engine.poll_resolve() {
-                    // Tests only use IP targets; resolution "fails".
                     let now = self.now;
-                    self.nodes[i].engine.resolved(r.id, Err(format!("no DNS in tests: {}", r.host)), now);
+                    let res = (self.resolver)(&r);
+                    self.nodes[i].engine.resolved(r.id, res, now);
                     moved = true;
                 }
                 while let Some(e) = self.nodes[i].engine.poll_event() {

@@ -501,10 +501,10 @@ fn uas_rejects_bad_requests_statelessly_enough() {
     inv.push_header("Call-ID", "c2");
     inv.push_header("CSeq", "1 INVITE");
     inv.push_header("Contact", "<sip:p@10.0.0.9>");
-    inv.push_header("Require", "100rel");
+    inv.push_header("Require", "100rel, x-unknown-ext");
     net.inject(0, P, &inv.to_bytes());
     let r = net.captured("SIP/2.0 420")[0].msg();
-    assert_eq!(r.header("Unsupported"), Some("100rel"));
+    assert_eq!(r.header("Unsupported"), Some("x-unknown-ext"), "only the unknown one");
     // Garbage is counted, not answered.
     net.inject(0, P, b"NOT SIP AT ALL\r\n\r\n");
     assert_eq!(net.engine(0).stats().malformed, 1);
@@ -595,4 +595,62 @@ fn transport_failure_fails_the_leg_with_its_cause() {
     assert!(matches!(&evs[..], [UaEvent::Failed(f), UaEvent::Terminated(_)] if f.cause.kind == CauseKind::Transport && f.cause.q850 == 38), "{evs:?}");
     assert!(e.snapshot(acc.leg).is_none());
     assert!(e.is_idle());
+}
+
+#[test]
+fn early_dialogs_per_leg_are_bounded() {
+    let mut net = Net::new();
+    net.add_with(A, 1, |c| UaConfig { max_early_dialogs: 4, ..c });
+    net.submit(0, originate("10.0.0.9", Some(sdp("o")))).unwrap();
+    let inv = net.captured("INVITE")[0].msg();
+    for i in 0..10 {
+        net.inject(0, P, &respond(&inv, 180, Some(&format!("fork{i}")), &[("Contact", "<sip:x@10.0.0.9>")], None));
+    }
+    assert_eq!(net.count(0, |e| matches!(e, UaEvent::Provisional(_))), 4);
+    assert_eq!(net.engine(0).stats().early_dialogs_dropped, 6);
+    // A known fork keeps working.
+    net.inject(0, P, &respond(&inv, 183, Some("fork1"), &[("Contact", "<sip:x@10.0.0.9>")], None));
+    assert_eq!(net.count(0, |e| matches!(e, UaEvent::Provisional(_))), 5);
+    // Two forks answer: one wins, one is counted as terminated.
+    net.inject(0, P, &respond(&inv, 200, Some("fork0"), &[("Contact", "<sip:x@10.0.0.9>")], Some(&sdp("a"))));
+    net.inject(0, P, &respond(&inv, 200, Some("fork9"), &[("Contact", "<sip:x@10.0.0.9>")], Some(&sdp("b"))));
+    assert_eq!(net.count(0, |e| matches!(e, UaEvent::Accepted(_))), 1);
+    assert_eq!(net.engine(0).stats().forks_terminated, 1);
+}
+
+#[test]
+fn branch_changing_clients_are_strict_by_default_and_lenient_on_request() {
+    for lenient in [false, true] {
+        let mut net = Net::new();
+        net.add_with(A, 1, |c| UaConfig { lenient_matching: lenient, ..c });
+        let inv = |branch: &str, method: Method| {
+            let mut m = SipMessage::request(method.clone(), "sip:a@10.0.0.1");
+            m.push_header("Via", format!("SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bK{branch};rport"));
+            m.push_header("From", "<sip:p@x>;tag=pt");
+            m.push_header("To", "<sip:a@x>");
+            m.push_header("Call-ID", "len");
+            m.push_header("CSeq", format!("1 {method}"));
+            m.push_header("Contact", "<sip:p@10.0.0.9>");
+            if method == Method::Invite {
+                m.push_header("Content-Type", "application/sdp");
+                m.body = sdp("o");
+            }
+            m.to_bytes()
+        };
+        net.inject(0, P, &inv("first", Method::Invite));
+        let leg = net.incoming_leg(0).unwrap();
+        net.submit(0, UaCommand::Provisional(ProvisionalRequest { leg, code: 180, reason: None, sdp: None, headers: vec![] })).unwrap();
+        net.inject(0, P, &inv("second", Method::Invite));
+        net.inject(0, P, &inv("third", Method::Cancel));
+        let lines: Vec<String> = net.captured.iter().map(Packet::first_line).collect();
+        if lenient {
+            assert_eq!(lines, ["SIP/2.0 100 Trying", "SIP/2.0 180 Ringing", "SIP/2.0 180 Ringing", "SIP/2.0 200 OK", "SIP/2.0 487 Request Terminated"]);
+            assert!(net.has(0, |e| matches!(e, UaEvent::Cancelled)));
+        } else {
+            assert_eq!(lines, ["SIP/2.0 100 Trying", "SIP/2.0 180 Ringing", "SIP/2.0 482 Loop Detected", "SIP/2.0 481 Call/Transaction Does Not Exist"]);
+        }
+        assert_eq!(net.count(0, |e| matches!(e, UaEvent::IncomingInvite(_))), 1);
+        net.submit(0, UaCommand::Hangup(HangupRequest { leg, reason: None, code: None })).ok();
+        assert!(net.settle(60_000), "lenient={lenient}");
+    }
 }

@@ -14,13 +14,27 @@ sip-core.workspace = true
 bumpalo.workspace = true
 ring.workspace = true
 md-5 = "0.11"
+# ferrosip's transports (UDP/TCP/TLS/WS/WSS) for `runtime::spawn_transport`.
+sip-transport = { workspace = true, optional = true }
+# ferrosip's registrar store for `routing::UsrlocContacts`.
+mod-location = { workspace = true, optional = true }
+
+[features]
+default = ["transport"]
+transport = ["dep:sip-transport"]
+location = ["dep:mod-location"]
 
 [lints]
 workspace = true
 
+[dev-dependencies]
+# The example B2BUA's rtpflux client reuses ferrosip's ng bencode codec.
+mod-media.workspace = true
+
 [[example]]
 name = "b2bua"
 path = "examples/b2bua/main.rs"
+required-features = ["transport"]
 
 [[example]]
 name = "bench"

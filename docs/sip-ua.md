@@ -16,7 +16,7 @@ what that means for a UA engine.
 | `sip-parser` | Zero-copy, lazy parser; slices of the receive buffer, allocated in a per-worker `Bump` that is reset after every message. `body()` is everything after the blank line. | Nothing can be kept past the worker iteration, and Content-Length is not applied to datagram bodies. → sip-ua converts to owned messages once (applying Content-Length and limits) at the engine boundary. |
 | `mod-txn` (tm) | Proxy transactions: §16.7 response aggregation across branches, failure/reply/branch routes, DNS failover, blocklist. `t_uac()` for locally generated requests. | `t_uac` reports **one** callback with the final status; no provisional events, no early-dialog state; the caller ACKs a 2xx itself and gets only the first one (forked 2xx are not surfaced); ACK/CANCEL can't be sent through it. Hostnames are resolved **synchronously on the calling thread** on a cache miss (`ruri_dests` → `resolver().resolve_uri`, up to `dns_timeout`). The transaction struct carries proxy-only state (branches, failure routes, suspend). → UA transactions are a different machine; sharing it would mean changing proxy semantics. sip-ua has its own §17 + RFC 6026 machines; nothing in `mod-txn` changed. |
 | `mod-dialog` | Dialog tracking for a proxy (state from relayed messages), timeouts with BYEs, `dlg_refer`, and `dlg_bridge`. | `dlg_bridge` is click-to-dial: INVITE one party with on-hold SDP, REFER it to the target, then BYE — not a persistent two-leg bridge. It doesn't own dialog state as a UA (CSeq, route set, offer/answer). |
-| `mod-ai` | A specialized UAS inside the routing script (`ai_answer` / `ai_dialog`): replies through the request context, handles retransmissions, CANCEL, BYE, re-INVITE, OPTIONS/INFO/UPDATE, its own RTP. | Tied to the script context and to its own media; no UAC side. A candidate to migrate onto sip-ua (§6). |
+| `mod-ai` | A specialized UAS inside the routing script (`ai_answer` / `ai_dialog`): replied through the request context, handled retransmissions, CANCEL, BYE, re-INVITE, OPTIONS/INFO/UPDATE, its own RTP. | Tied to the script context and to its own media; no UAC side. **Migrated onto sip-ua (§6).** |
 | `sip-core::net` | `Dest` (proto, address, connection id), `Outbound::send`, transport events (`TransportEvent::Closed`). | Reused as is: sip-ua addresses everything with `Dest`, so a driver can hand transmits to `Outbound` and keep connection affinity. |
 | `sip-core::timer::TimerWheel` | Tick-based wheel driven by the tm timer thread. | It can't say when the next timer is due, which a sans-IO engine must expose (`next_timeout`) so any driver can sleep exactly. sip-ua uses a binary heap with lazy cancellation (stale entries are skipped when popped); a ferrosip-worker driver can still tick it from the wheel. |
 | `sip-core::dns` | RFC 3263 resolver with cache (NAPTR → SRV → A/AAAA). Blocking UDP/TCP queries. | Reused through the driver (`SystemResolver`), on a helper thread, never on the engine thread. |
@@ -32,7 +32,7 @@ test suite passes unchanged.
 ```
             commands (bounded)                    transmits / resolve requests
  softswitch ───────────────────► ┌──────────────┐ ──────────────────────────► driver
- (owns calls,                    │   UaEngine   │                              (UDP runtime, or
+ (owns calls,                    │   UaEngine   │                              (sip-transport,
   bridges, media)  ◄──────────── │  sans-IO     │ ◄──────────────────────────  ferrosip workers)
             events (bounded)     └──────────────┘   datagrams, clock, DNS results
                                    legs → dialogs → transactions → timers
@@ -94,23 +94,27 @@ CANCEL, and late responses after `Terminated` all end in exactly one
 
 ### With ferrosip
 
-The `runtime` module is a std UDP driver, enough for the example and tests.
-The production integration (not done yet) is a driver inside the
-`sip-transport` workers:
+`runtime::spawn_transport` (feature `transport`) runs an engine on
+ferrosip's transport layer, the same `sip_transport::start()` the proxy
+binary uses:
 
-- inbound: requests/responses that belong to the UA (by listener, by a
-  routing-script decision such as `ua.handle()`, or by Call-ID/dialog
-  lookup) go to `UaEngine::handle_message` with the `Dest` the transport
-  already has (connection id included, which gives reliable-transport and
-  RFC 5626 flow affinity for free);
-- outbound: `Transmit`s go to `Outbound::send`; a send error or a
-  `TransportEvent::Closed` goes back through `handle_send_error` /
-  `handle_flow_closed`;
-- timers: from the tm timer thread's tick, or a per-engine deadline;
-- DNS: the existing resolver on a helper thread, as the runtime does.
+- inbound: the engine is the transport's `Handler`; each message (Via
+  already stamped with `received`/`rport`) is copied with its `Dest`
+  (connection id included) into the engine's bounded input queue. When the
+  queue is full, new requests get a stateless 503 + Retry-After and other
+  messages are dropped (their senders retransmit); both are counted in
+  `RuntimeStats`;
+- outbound: `Transmit`s go to `Net::send` (`Outbound`), which reuses the
+  connection a dialog arrived on, or dials TCP/TLS/WS/WSS; a failed send
+  goes back through `handle_send_error`, a `TransportEvent::Closed`
+  through `handle_flow_closed`;
+- Via/Contact use the addresses the transport advertises per protocol;
+- DNS: ferrosip's resolver on a helper thread; timers: the engine's own
+  deadline (`next_timeout`) drives the loop's wait.
 
-Proxy defaults and semantics are untouched: the proxy path never reaches
-the engine unless the configuration routes requests to it.
+One engine thread owns every leg; scaling further means several engines
+sharded by Call-ID (not done). The proxy binary does not use this; proxy
+defaults and semantics are untouched.
 
 ### With rtpflux
 
@@ -128,10 +132,19 @@ other leg, `release` frees the session when both legs are gone.
   the remote leg was accepted, the compensation is `Hangup` (the engine
   sends ACK first where required, then BYE). Media failures enter as
   application decisions, never as direct SIP actions by rtpflux.
-- Not done yet: an rtpflux client implementing `MediaAdapter` with ng
-  `offer`/`answer` (or the companion spec's endpoint API) and the
-  cross-repo test against a real rtpflux. The example runs media
-  passthrough only.
+- `examples/b2bua/rtpflux.rs` implements `MediaAdapter` over rtpflux's ng
+  protocol (`offer`/`answer`/`delete`, retried with the same cookie on a
+  lost datagram). The two SIP legs have independent Call-IDs, so the media
+  session gets synthetic ids: `call-id = b2b-<call>`, one tag per leg; a
+  re-offer names the other leg's tag, and rtpflux swaps roles when the
+  first answerer re-offers. No undocumented ng flags are used.
+- `tests/b2bua_rtpflux.rs` starts a real rtpflux (skipped without the
+  binary): both parties see only relay ports, RTP flows both ways through
+  the relay, a hold re-INVITE from the callee keeps the relay ports, and
+  hangup deletes the media session.
+- Media failure handling in the example: an offer the relay refuses
+  rejects the inbound INVITE with 488; an answer it refuses hangs up the
+  outbound leg (ACK + BYE), which then tears down the inbound one.
 
 ## 5. Restart and drain
 
@@ -144,19 +157,35 @@ other leg, `release` frees the session when both legs are gone.
   ownership fencing and lost TCP/TLS/WS flows are P2; no transparent
   failover is claimed.
 
-## 6. Migration guide: mod-ai onto sip-ua (P1)
+## 6. mod-ai on sip-ua (migrated)
 
-1. Route `ai_answer` to a UA engine owned by the module: the INVITE goes
-   to `handle_message` instead of being answered through `Ctx`; the
-   module's `IncomingInvite` handler calls `Accept` with the SDP it builds
-   today.
-2. Replace `ai_dialog()`'s hand-written ACK/BYE/CANCEL/re-INVITE handling
-   with `Ack`, `RemoteBye`, `Cancelled`, `RemoteOffer` events
-   (`RespondToOffer` with the same "new media address" answer).
-3. The model's `end_call` and provider failures become `Hangup`.
-4. Keep the script API (`ai.answer`, `ai.dialog`) and the reply table in
-   its README unchanged; the e2e suite `tests/e2e_ai.py` is the regression
-   gate.
+mod-ai's hand-rolled SIP (stateless replies from the request context, its
+own 200 OK retransmission and ACK wait, BYE through `t_uac`) is replaced by
+a module-owned engine (`crates/mod-ai/src/ua.rs`):
+
+- `ai_answer()` keeps its own checks and their replies unchanged (488,
+  486, 503, 400, 500 with a `Warning`), then hands the INVITE to the
+  engine, which sends 100 Trying and owns the transaction;
+- `ai_dialog()` feeds every message of an AI call (by Call-ID) to the
+  engine: ACK, BYE, CANCEL, re-INVITE, retransmissions, OPTIONS/INFO/UPDATE;
+- the call thread answers (`Accept` with its SDP), rejects (`Reject` with
+  the same Warning) and hangs up (`Hangup`); engine events become its
+  existing `Ev`s (`Ack`, `Bye`, `Remote` for a re-INVITE's new address,
+  `Ended` when the engine ended the dialog, e.g. no ACK);
+- a 10 ms ticker runs the engine's timers; transmissions go through the
+  proxy's transport (`Outbound`); the engine sits behind a mutex (AI call
+  rates are low and every section is short);
+- session timers of our own stay off (`session_expires: None`), so the
+  wire behaviour stays as before unless the caller asks for one;
+- `lenient_matching` (off by default in the engine) keeps accepting
+  callers that resend an INVITE or send a CANCEL with a new Via branch,
+  which mod-ai matched by Call-ID before (its e2e suite does this).
+
+Regression gate: `tests/e2e_ai.py` (mock OpenAI and Gemini), all 53
+checks, before and after. One check's setup changed: the 487 to a CANCEL
+now comes from the SIP stack at once instead of after the call thread
+noticed, so the test waits for that call to be recorded before starting
+the next one whose ordering it compares.
 
 ## 7. Benchmarks
 
@@ -188,6 +217,23 @@ consecutive runs of `bench 50000 20000` (machine load not controlled):
 
 These are single-machine engineering numbers, not a capacity claim.
 
+Cost of the later features (session timers on by default, PRACK, REFER,
+identity, failover, DTMF), same machine, A/B back to back against the
+first version, three runs each:
+
+| Build | Calls/s | Bytes per established call |
+|---|---|---|
+| first version (P0a/P0b) | 13 096 – 13 687 | 5 558 – 5 570 |
+| current | 12 065 – 12 895 | 7 349 – 7 358 |
+
+About −6 % call rate and +1.8 KB per call (two legs). Disabling session
+timers (`session_expires: None`) saves ≈ 0.4 KB and no measurable time.
+The rest of the memory is per-leg extension state (≈ 400 B inline per leg,
+PRACK state alone 168 B, unused on most calls) and the last local SDP each
+leg keeps for re-INVITE refreshes; boxing the rarely used parts lazily is
+the next step if it matters. (Profiling with perf was not possible on the
+development machine: `perf_event_paranoid` = 4.)
+
 The proxy was not modified, so the proxy before/after comparison the
 specification asks for (≥5 % median throughput or ≥10 % p99 regression
 gate) has nothing to measure yet; it applies when the worker-integrated
@@ -196,24 +242,30 @@ it).
 
 ## 8. Status and next steps
 
-Done (P0a, P0b, most of P0c's offer/answer):
-audit, contract, deterministic harness, transactions, UAC/UAS dialogs,
-CANCEL and its races, forked 2xx, digest auth, early/delayed offer,
-re-INVITE/UPDATE with glare and rollback, overload/drain/backpressure,
-UDP runtime, example B2BUA, interop with independent UAs, fuzzing.
+Done:
 
-Not done — in order:
+- P0a/P0b: audit, contract, deterministic harness, transactions, UAC/UAS
+  dialogs, CANCEL and its races, forked 2xx (bounded per leg), digest
+  auth, overload, drain and event backpressure;
+- P0c: offer/answer (early, delayed, re-INVITE, UPDATE, glare, rollback),
+  RFC 3262 PRACK and early UPDATE, RFC 4028 session timers, RFC 3263
+  failover, the rtpflux media adapter with a cross-repo test;
+- transports: UDP, TCP, TLS, WS and WSS through `sip-transport`;
+- P1: REFER/NOTIFY and Replaces (blind and attended transfer
+  signalling), 3xx policy with loop protection, trusted identity and
+  privacy by policy, SIP INFO DTMF with the RTP-DTMF flag, registrar
+  (usrloc) and trunk routing adapters, mod-ai migrated;
+- interop with independent UAs (Python, UDP and TCP), fuzzing, benchmarks.
 
-1. **P0c**: RFC 3262 PRACK / reliable provisionals; RFC 4028 session
-   timers (422 handling, refresh, expiry per leg); RFC 3263 failover to the
-   next target; rtpflux `MediaAdapter` and the cross-repo test.
-2. **Transports**: the `sip-transport` worker driver (TCP, TLS, WS, WSS,
-   SIP Outbound), with the scenario suite run over each; proxy
-   before/after benchmark.
-3. **Interop**: FreeSWITCH, Asterisk, PJSIP; SIPp runs in CI only (not
+Not done:
+
+1. **Interop**: FreeSWITCH, Asterisk, PJSIP; SIPp runs in CI only (not
    installed where this was developed); `tc netem` impaired-UDP runs;
-   packet-capture assertions.
-4. **P1**: REFER/NOTIFY, Replaces, transfers, fork policy hooks, 3xx
-   policy, INFO packages / DTMF de-duplication, identity/privacy policy,
-   registrar/trunk adapters, mod-ai migration.
-5. **P2**: recoverable state, cluster ownership.
+   packet-capture assertions; long soak; the scenario suite over TCP/TLS
+   (the simulated scenarios are UDP; reliable transports have loopback tests).
+2. RFC 6086 Info Packages (`Recv-Info` negotiation); offers inside PRACK;
+   early UPDATE from a UAC with several early dialogs; REFER outside a
+   dialog and multiple concurrent REFER subscriptions per dialog.
+3. Several engines sharded by Call-ID behind one transport; a proxy
+   before/after benchmark once something in the proxy path changes.
+4. **P2**: recoverable state, cluster ownership.

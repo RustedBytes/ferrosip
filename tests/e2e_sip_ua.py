@@ -9,6 +9,8 @@ scenarios when `sipp` is installed.
 - a busy callee's 486 reaches the caller;
 - a caller's CANCEL while ringing cancels the outbound leg: 200 to the
   CANCEL, 487 to the INVITE, and the callee sees the CANCEL;
+- a caller over TCP reaches a callee over UDP (the BYE goes back over
+  the caller's connection);
 - SIPp: 20 calls uac → B2BUA → uas complete.
 
 Run from the repo root after
@@ -31,7 +33,7 @@ def check(name, ok, detail=""):
 
 
 def start_b2bua(listen, target):
-    p = subprocess.Popen([BIN, f"127.0.0.1:{listen}", f"127.0.0.1:{target}"], stderr=subprocess.PIPE, text=True)
+    p = subprocess.Popen([BIN, f"udp:127.0.0.1:{listen},tcp:127.0.0.1:{listen}", f"127.0.0.1:{target}"], stderr=subprocess.PIPE, text=True)
     lines = []
     ready = threading.Event()
 
@@ -71,6 +73,33 @@ def basic_call():
         check("BYE answered 200", b is not None and b.code == 200, repr(b))
         time.sleep(0.3)
         check("callee got the BYE", any(m.method == "BYE" for m in callee.received))
+    finally:
+        caller.close()
+        callee.close()
+
+
+def tcp_caller():
+    callee = UA("bob", CALLEE, ("127.0.0.1", B2B)).auto_answer(ring=True)
+    caller = UA("alice", CALLER, ("127.0.0.1", B2B), transport="tcp")
+    try:
+        r, d = caller.call(f"sip:bob@127.0.0.1:{B2B};transport=tcp")
+        check("TCP caller answered", r is not None and r.code == 200, repr(r))
+        if d is None:
+            return
+        time.sleep(0.3)
+        inv = next((m for m in callee.received if m.method == "INVITE"), None)
+        ack = next((m for m in callee.received if m.method == "ACK"), None)
+        check("callee leg is UDP", inv is not None and "SIP/2.0/UDP" in (inv.get("via") or ""))
+        # The callee hangs up; the BYE must reach the caller over its TCP connection.
+        if inv is not None and ack is not None:
+            raw = (f"BYE {inv.get('contact').strip('<>')} SIP/2.0\r\nVia: {callee.via('byeb' + str(time.time_ns()))}\r\n"
+                   f"From: {ack.get('to')}\r\nTo: {inv.get('from')}\r\nCall-ID: {inv.get('call-id')}\r\nCSeq: 2 BYE\r\n"
+                   f"Max-Forwards: 70\r\nContent-Length: 0\r\n\r\n")
+            callee.send(raw)
+            got = caller.request_in("BYE", timeout=4)
+            check("BYE relayed to the TCP caller", got is not None)
+            if got is not None:
+                caller.respond(got, 200)
     finally:
         caller.close()
         callee.close()
@@ -133,6 +162,7 @@ def main():
     p = start_b2bua(B2B, CALLEE)
     try:
         basic_call()
+        tcp_caller()
         busy()
         cancel()
         sipp()

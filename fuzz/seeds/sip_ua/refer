@@ -1,0 +1,9 @@
+REFER sip:ua@127.0.0.1 SIP/2.0
+Via: SIP/2.0/UDP 127.0.0.2:5060;branch=z9hG4bKr1
+From: <sip:a@x>;tag=ft
+To: <sip:ua@x>;tag=TAG
+Call-ID: fz
+CSeq: 4 REFER
+Refer-To: <sip:c@x?Replaces=a%40b%3Bto-tag%3Dx%3Bfrom-tag%3Dy>
+Content-Length: 0
+

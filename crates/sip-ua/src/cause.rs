@@ -31,6 +31,8 @@ pub enum CauseKind {
     ProtocolViolation,
     /// The engine shed the leg (event queue overflow, drain).
     Overload,
+    /// RFC 4028: the session was not refreshed in time.
+    SessionExpired,
     /// Normal clearing by BYE (either side).
     NormalClearing,
     /// Rejected or hung up by the application.
@@ -48,12 +50,15 @@ pub struct Cause {
     pub q850: u16,
     /// Human-readable detail (never contains credentials).
     pub detail: Option<String>,
+    /// A 3xx's Contact URIs, best q first, for the application to follow
+    /// (when the engine doesn't, see `UaConfig::max_redirects`).
+    pub contacts: Vec<String>,
 }
 
 impl Cause {
     pub fn new(kind: CauseKind) -> Self {
         let q850 = match kind {
-            CauseKind::Timeout | CauseKind::NoAck | CauseKind::AnswerTimeout => 102,
+            CauseKind::Timeout | CauseKind::NoAck | CauseKind::AnswerTimeout | CauseKind::SessionExpired => 102,
             CauseKind::Transport | CauseKind::Dns => 38,
             CauseKind::Cancelled => 16,
             CauseKind::AuthFailed => 21,
@@ -61,11 +66,11 @@ impl Cause {
             CauseKind::Overload => 42,
             CauseKind::NormalClearing | CauseKind::Local | CauseKind::SipResponse => 16,
         };
-        Self { kind, sip: None, q850, detail: None }
+        Self { kind, sip: None, q850, detail: None, contacts: Vec::new() }
     }
 
     pub fn sip(kind: CauseKind, code: u16, reason: impl Into<String>) -> Self {
-        Self { kind, q850: q850_for_sip(code), sip: Some(SipStatus { code, reason: reason.into() }), detail: None }
+        Self { kind, q850: q850_for_sip(code), sip: Some(SipStatus { code, reason: reason.into() }), detail: None, contacts: Vec::new() }
     }
 
     pub fn with_detail(mut self, d: impl Into<String>) -> Self {

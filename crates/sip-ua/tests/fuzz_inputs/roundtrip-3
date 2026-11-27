@@ -1,0 +1,76 @@
+INVITE sip:bob@exae.cocp SIP/2.0
+Via: So=IP/2.0/UDP 10.0.ID: c1
+CSeq: 1 INVITE
+Contact:is< pd:1x,,,.!A" <sip:d@x>;tag=2
+To: ip:bob@ebanc:bob@emxaple.com>
+Call-ID: c1
+CSeq: 1 INVITE
+Contact: <sip:.,,,,,,uuiip:a@1.2.3.4:5060;ob>;exp>;ex,,,I	,,,,,,,,,,u}id:1>",,,,,,,,.,,,,,,,,,,uuid:1>",,,,,uuid:1>,<: 4
+CSeq: 1 INVITE
+Contact: <sip:a@0.2.3.4:5060;ob>;exp,>",,,,2
+To: ip:bob@ebanc:bob@emxaple.com>
+Call-ID: c0
+CSeq: 1 INVITE
+Contact: <sip:.,,,,,,,,,,uuiip:a@0.2.3.4:5060;ob>;exp>;ex,,,I	,,,,,,,,,,uuid:1>",,,,INVITE sip SIP/2.0
+Via:.3.x-rds  
+10!Vim:  *C.00 St: %<s8
+ INVITE
+Contact: <sip:a@1.2.3.4:5060;ob>;exp,>",,,,,uuid:1>,<: 4
+CSeq: CSeq: 1 INVIT<: 6
+CSeq: 1 INVITE
+C0.1:50;bbanc 69
+From: !A" <sip:d@x>;tag=2
+To: ip:bob@ebanc:bob@emxaple.com>: c1
+CSeq: 1 INVITE
+Contact: <siF0p:.,,,,,,,,,,uuid:1>",,,,,uuid:1>,<: 4
+CSeq: 1 INVIsip:4
+CSeq: 1 INVITE
+Contact: <sip:a@0.2.3.4:5060;ob>;exp>;ex,,,I	,,,,,.4:5060;ob>;exp>;ex,,,I	,,,,,,,,,,uuid:1>",,,,,,,uid:10.0.ID: c1
+CSeq: 1 INVITE
+ <sip:d@x>;tag=2
+To: ip:bob@ebanc:bob@emxaple.com>
+Call-ID: c1
+CSeq: 1 INVITE
+Contact: <sip:.,,,,,,uuiip:a@1.2.3.4:5060;ob>;exp>;ex,,,I	,,,/2.0
+Via: So=IP/2.0/UDP 10.0.ID: c1
+CSeq: 1 INVITE
+Contact:is< pd:1x,,,.!A" <sip:d@x>;tag=2
+To: ip:bob@ebanc:bob@emxaple.com>
+Call-ID: c1
+CSeq: 1 INVITE
+Contact: <sip:.,,,,,,uuiip:a@1.2.3.4:5060;ob>;exp>;ex,,,I	,,,,,,,,,,u}id:1>",,,,,,,,.,,,,,,,,,,uuid:1>",,,,,uuid:1>,<: 4
+CSeq: 1 INVITE
+Contact: <sip:a@0.2.3.4:5060;ob>;exp,>",,,,2
+To: ip:bob@ebanc:bob@emxaple.com>
+Call-ID: c0
+CSeq: 1 INVITE
+Contact: <sip:.,,,,,,,,,,uuiip:a@0.2.3.4:5060;ob>;exp>;ex,,,I	,,,,,,,,,,uuid:1>",,,,,,,,,,uuid:1x,,,.,,,,,,,,,,uuid:1>",,,,,uuid:1>,<: 4
+CSeq: 1 INVITE
+Contact: <sip:a@1.2.3.4:5060;ob>;exp,>",,,,,uuid:1>,<: 4
+CSeq: CSeq: 1 INVIT<: 6
+CSeq: 1 INVITE
+C0.1:50;bbanc 69
+From: !A" <sip:d@x>;tag=2
+To: ip:bob@ebanc:bob@emxaple.com>: c1
+CSeq: 1 INVITE
+Contact: <siF0p:.,,,,,,,,,,uuid:1>",,,,,,,,,,,u}id:1>",,,,,,,,.,,,,,,,,,,uuid:1>",,,,,uuid:1eq: 1 INVITE
+Contact: <sip:a@0.2.3.4:5060;ob>;exp,>",,,,2
+To: ip:bob@ebanc:bob@emxaple.com>
+Call-ID: c0
+CSeq: 1 INVITE
+Contact: <sip:.,,,,,,,,,,uuiip:a@0.2.3.4:5060;ob>;exp>;ex,,,I	,,,,,,,,,,uuid:1>",,,,,,,,,,uuid:1x,,,.,,,,,,,,,,uuid:1>",,,,,uuid:1>,<: 4
+CSeq: 1 INVITE
+Contact: <sip:a@1.2.3.4:5060;ob>;exp,>",,,,,uuid:1>,<: 4
+CSeq: CSeq: 1 INVIT<: 6
+CSeq: 1 INVITE
+C0.1:50;bbanc 69
+From: !A" <sip:d@x>;tag=2
+To: ip:bob@ebanc:bob@emxaple.com>: c1
+CSeq: 1 INVITE
+Contact: <siF0p:.,,,,,,,,,,uuid:1>",,,,,uuid:1>,<: 4
+CSeq: 1 INVIsip:4
+CSeq: 1 INVITE
+Contact: <sip:a@0.2.3.4:5060;ob>;exp>;ex,,,I	,,,,,.4:5060;ob>;exp>;ex,,,I	,,,,,,,,,,uuiq: 1 INVITE
+Contatact: <sip:a@act: <.2.3.4:5060;ob>;exp>;ex,,,,,,,,,,,,,uuid:1>",,,,,uuid:0>,<: 4
+
+0

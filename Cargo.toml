@@ -46,6 +46,7 @@ mod-async = { path = "crates/mod-async", default-features = false }
 mod-ops = { path = "crates/mod-ops" }
 mod-webui = { path = "crates/mod-webui" }
 mod-ai = { path = "crates/mod-ai" }
+sip-ua = { path = "crates/sip-ua", default-features = false }
 mod-prometheus = { path = "crates/mod-prometheus" }
 
 # Lints every crate opts into with `[lints] workspace = true`.

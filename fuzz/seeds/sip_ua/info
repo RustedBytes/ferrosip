@@ -1,0 +1,11 @@
+INFO sip:ua@127.0.0.1 SIP/2.0
+Via: SIP/2.0/UDP 127.0.0.2:5060;branch=z9hG4bKi1
+From: <sip:a@x>;tag=ft
+To: <sip:ua@x>;tag=TAG
+Call-ID: fz
+CSeq: 5 INFO
+Content-Type: application/dtmf-relay
+Content-Length: 24
+
+Signal=5
+Duration=160

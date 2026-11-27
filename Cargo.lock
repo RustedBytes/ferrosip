@@ -894,13 +894,13 @@ name = "mod-ai"
 version = "0.1.0"
 dependencies = [
  "bumpalo",
- "mod-txn",
  "ring",
  "rustls",
  "serde_json",
  "sip-core",
  "sip-parser",
  "sip-transport",
+ "sip-ua",
  "webpki-roots",
 ]
 
@@ -1774,9 +1774,12 @@ version = "0.1.0"
 dependencies = [
  "bumpalo",
  "md-5",
+ "mod-location",
+ "mod-media",
  "ring",
  "sip-core",
  "sip-parser",
+ "sip-transport",
 ]
 
 [[package]]

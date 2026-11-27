@@ -210,6 +210,10 @@ fn expand(name: &str) -> &str {
 /// (a bare CR or LF, NUL…) makes the message malformed: normalising it
 /// instead would change how the value tokenizes once re-serialized.
 fn unfold(v: &str) -> Result<String, MsgError> {
+    // Almost every value has no control character except tabs: copy it.
+    if !v.chars().any(|c| c.is_control() && c != '\t') {
+        return Ok(v.trim().to_string());
+    }
     let mut out = String::with_capacity(v.len());
     let mut it = v.chars().peekable();
     while let Some(c) = it.next() {
@@ -357,6 +361,16 @@ impl SipMessage {
     /// RFC 3261 §8.1.1 mandatory headers.
     fn validate(&self) -> Result<(), MsgError> {
         self.top_via().ok_or(MsgError::Missing("Via"))?;
+        // Every Via value must parse, not only the first two the lazy
+        // parser looks at: a later one can become the top Via of a
+        // response we build (and of this message once re-serialized).
+        for line in self.header_lines("Via") {
+            let mut rest = Some(line.as_bytes());
+            while let Some(r) = rest {
+                let (_, next) = parse_via(r).ok_or(MsgError::Missing("Via"))?;
+                rest = next;
+            }
+        }
         self.header("From").ok_or(MsgError::Missing("From"))?;
         self.header("To").ok_or(MsgError::Missing("To"))?;
         self.call_id().ok_or(MsgError::Missing("Call-ID"))?;
@@ -498,9 +512,10 @@ impl SipMessage {
         (mime.eq_ignore_ascii_case("application/sdp") && !self.body.is_empty()).then_some(self.body.as_slice())
     }
 
-    /// Option tag `tag` is listed in `name` (Supported, Require…).
+    /// Option tag `tag` is listed in `name` (Supported, Require…). Option
+    /// tags are tokens, so a plain comma split is exact (and allocates nothing).
     pub fn has_option(&self, name: &str, tag: &str) -> bool {
-        self.values(name).iter().any(|v| v.eq_ignore_ascii_case(tag))
+        self.header_lines(name).any(|l| l.split(',').any(|v| v.trim().eq_ignore_ascii_case(tag)))
     }
 
     /// Serialize; Content-Length is always written and always correct.

@@ -16,6 +16,18 @@ pub trait MediaAdapter {
     fn release(&mut self, call: u64);
 }
 
+impl<T: MediaAdapter + ?Sized> MediaAdapter for Box<T> {
+    fn offer(&mut self, call: u64, from: UaLegId, sdp: &[u8]) -> Result<Vec<u8>, String> {
+        (**self).offer(call, from, sdp)
+    }
+    fn answer(&mut self, call: u64, from: UaLegId, sdp: &[u8]) -> Result<Vec<u8>, String> {
+        (**self).answer(call, from, sdp)
+    }
+    fn release(&mut self, call: u64) {
+        (**self).release(call)
+    }
+}
+
 /// Media flows end to end; only signalling goes through the B2BUA.
 #[derive(Default)]
 pub struct Passthrough {
@@ -149,7 +161,12 @@ impl<M: MediaAdapter> Bridge<M> {
                 }
             }
             UaEvent::Terminated(t) => self.terminated(leg, &t.cause, submit),
-            UaEvent::Cancelled | UaEvent::RemoteBye(_) | UaEvent::Info(_) | UaEvent::CommandRejected(_) => {}
+            // Executing a transfer (calling the target, re-inviting the
+            // other leg) is softswitch policy; this example declines.
+            UaEvent::ReferRequested(_) => {
+                let _ = submit(UaCommand::RespondToRefer(ReferResponse { leg, accept: false }));
+            }
+            UaEvent::ReferProgress(_) | UaEvent::Cancelled | UaEvent::RemoteBye(_) | UaEvent::Info(_) | UaEvent::CommandRejected(_) => {}
         }
     }
 
