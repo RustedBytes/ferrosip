@@ -59,6 +59,7 @@ ferrosip/
 │   ├── mod-lua/               app_lua (Lua 5.4 via mlua, KEMI-style KSR API)
 │   ├── mod-webui/             webui: read-only admin UI (Preact + TypeScript SPA, embedded)
 │   ├── mod-ai/                ai: answer calls with OpenAI Realtime / Gemini Live
+│   ├── sip-ua/                sans-IO SIP UA engine (UAC/UAS dialogs) for B2BUAs (docs/sip-ua.md)
 │   ├── mod-prometheus/        prometheus: exporter with labels, latency histograms
 │   ├── sip-diameter/          Diameter base (RFC 6733): codec, peers (CER/DWR), Kamailio XML config
 │   ├── mod-ims/               cdp, ims_auth, ims_usrloc/registrar_scscf (+ reg event), ims_isc,
@@ -87,6 +88,7 @@ ferrosip/
 ├── tests/e2e_json.py          http_client, jansson/json, jsonrpcs (REST server decides the route)
 ├── tests/e2e_dns.py           NAPTR/SRV routing, DNS failover, t_load/next_contacts (fake DNS server)
 ├── tests/e2e_ims.py           P-/I-/S-CSCF + AS with a scripted HSS/PCRF/OCS; reg event, IPsec agreement
+├── tests/e2e_sip_ua.py        sip-ua example B2BUA between independent UAs (sipkit; SIPp when installed)
 ├── tests/e2e_shutdown.py       graceful shutdown: 503 while draining, in-flight calls finish, exit 0
 ├── tests/e2e_limits.py         per-IP connection limit, unit accounting
 ├── tests/interop_sipp.py      SIPp interop: calls over UDP/TCP/TLS, digest REGISTER, CANCEL (tests/sipp/)

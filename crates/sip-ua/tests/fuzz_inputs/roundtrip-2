@@ -1,0 +1,130 @@
+INVITE sip:bob~@example.com;transport=!tcp SIP/2.0
+Via: SIP/0/ds:rom: "all-I:` <si4b@eb:pxample.coVITE
+D:  I
+D: c1
+CSeq: 1 INVITE
+Contact:, r 1 INVITE
+D:  I
+D: c1hG4bK-alD: c1t:, r 1 INVITE
+D:  I
+D: c1hG4bK-alD: c1Sq
+e:C 1 ISq
+e:C 1 INVITE
+D: m>
+Call-ID: c:5070;rep:bob~@example.com;transport=TE
+Contact:, r 1 INVITE
+D:  I
+D: c1hG4bK-alD: c1t:, r 1 INVITE
+D:  I
+D: c1hG4bK-alD: c1Sq
+e:C 1 IS
+e:C 1 INVITE
+D:  s:ll-ID: c1Sq
+e:C 1 INVITE
+D:  s:rx9q
+e:C 1 INVITE
+D:  s:rx9hG4bK-alD: c1Sq
+e:C 1 INVITE
+D:  I
+D: c1
+CSrom: "Il-alD: c1Sq
+e:C1Sq
+e:C 1 INVITE
+D:  I
+D: c1
+CSeq: 1 INVITE
+Contact:, r 1 INVITE
+D:1 INVITE
+D:  I
+D: c1
+CSrom: "Il-alD: c1Sq  I
+D: c1hG4bK-alD: c1Sq
+e:C 1 INVITE
+D:  I
+D: c1
+CSrom: "Il-alD: c1Sq
+e:C1Sq
+e:x9q
+e:C 1 INVITE
+D:  s:rz9hG4bK-alD: c1Sq
+e:C 1 INVITE
+D!tcrom: "all-ID: c2Sq
+e:C 1 INVITE
+D:  s:ll-ID: c1Sq
+e:C 1 INVITE
+D:  s:rx9q
+e:C 1 INVITE
+D:  s:rx9hG4bK-alD: c1Sq
+e:C 1 INVITE
+D:  I
+D: c1
+CSrom: "Il-alD: c1Sq
+e:C1Sq
+e:C 1 INVITE
+D:  I
+D: c1
+CSeq: 1 INVITE
+Contact:, r 1 INVITE
+D:1 INVITE
+D:  I
+D: c1
+CSrom: "Il-alD: c1Sq  I
+D: c1hG4bK-alD: c1Sq
+e:C 1 INVITE
+D:  I
+D: c1
+CSrom: "Il-alD: c1Sq
+e:C1Sq
+e:x9q
+e:C 1 INVITE
+D:  s:rz9hG4bK-alD: c1Sq
+e:C 1 INVITE
+D:  I
+D: c1
+CSrom: "Il-alD: c1Sq
+e:C1Sq
+e:C 1 INVITE
+D:  I
+D: c1
+CSeq: 1 INVITE
+Contact:, r 1 INVITE
+D:  I
+D: c1hG4b: c1
+CSeq: 1 INVITE
+Contact:, r 1 INVITE
+D:1 INVITE
+D:  I
+D: c1
+CSrom: "Il-alD: c1Sq  I
+D: c1hG4bK-alD: c1Sq
+e:C 1 INVITE
+D:  I
+D: c1
+CSrom: "Il-alD: c1Sq
+e:C1Sq
+e:x9q
+e:C 1 INVITE
+D:  s:rz9hG4bK-alD: c1Sq
+e:C 1 INVITE
+D:  I
+D: c1
+CSrom: "Il-alK-alD: c1Sq
+e:C 1 INVITE
+D:  I
+D: c1
+CSrom: "Il-alD: c1Sq
+e:C1Sq
+e:C 1 INVITE
+D:  I
+D: c1
+CSeq: 1 INVITE
+Contact:, r 1D: c1Sq
+e:C 1 INVITE
+D:  s:rx9hG4bK-alD: c1Sqe:C
+ 1 INVITE
+D:  I
+D: c1
+CSrx-Norwards: 70
+From: "A" <sip:a@x>;tag=1
+To: <si9b@eb:pxample.com>
+Call-ID: c:5070csip:~=0

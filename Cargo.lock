@@ -1769,6 +1769,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sip-ua"
+version = "0.1.0"
+dependencies = [
+ "bumpalo",
+ "md-5",
+ "ring",
+ "sip-core",
+ "sip-parser",
+]
+
+[[package]]
 name = "sipflood"
 version = "0.1.0"
 dependencies = [
