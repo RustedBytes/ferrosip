@@ -12,19 +12,25 @@
 //!   was established on (connection id in the leg's flow).
 //!
 //! The engine thread never waits for the application or for DNS.
+//!
+//! Sharding (`RuntimeConfig::shards` > 1): that many engines, each on its
+//! own thread, behind the same listeners. Received messages are routed by
+//! Call-ID, commands by leg id (see [`crate::shard`]); events of all
+//! shards arrive on the one event channel (`seq` is per leg, `log_seq` per
+//! shard). One DNS thread serves every shard.
 
 use crate::api::{Accepted, CommandError, EventEnvelope, UaCommand, UaEvent};
 use crate::engine::{ResolveRequest, Transmit, UaConfig, UaEngine};
+use crate::fence::EgressFence;
 use crate::ids::{Generation, IdAllocator, OperationId, SystemEntropy, UaLegId};
+use crate::shard::{Shard, shard_for_message, shard_of_leg};
 use sip_core::{Dest, Proto};
 use std::collections::VecDeque;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::Arc;
-#[cfg(feature = "transport")]
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -49,22 +55,32 @@ enum Input {
     #[cfg_attr(not(feature = "transport"), allow(dead_code, reason = "only the transport front end reports closed flows"))]
     FlowClosed(Dest),
     Resolved(u64, Result<Vec<Dest>, String>),
+    Lease(Instant),
     Drain,
     Shutdown,
 }
 
 /// Sizes of the bounded queues.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     /// Commands and received messages waiting for the engine thread.
     pub input_capacity: usize,
     pub event_capacity: usize,
     pub resolve_capacity: usize,
+    /// Owner epoch the engine starts with (from the ownership authority).
+    pub epoch: u64,
+    /// Egress fence: a transmit of an older epoch is dropped, and the
+    /// engine halts (its ownership is gone). See [`EgressFence`].
+    pub egress_fence: Option<EgressFence>,
+    /// Engines (threads) behind the listeners; 1: no sharding.
+    pub shards: u32,
+    /// Ownership lease the engines start with (see [`UaHandle::renew_lease`]).
+    pub lease_until: Option<Instant>,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        Self { input_capacity: 8_192, event_capacity: 4_096, resolve_capacity: 256 }
+        Self { input_capacity: 8_192, event_capacity: 4_096, resolve_capacity: 256, epoch: 0, egress_fence: None, shards: 1, lease_until: None }
     }
 }
 
@@ -75,13 +91,23 @@ pub struct RuntimeStats {
     pub dropped_input: AtomicU64,
     /// New requests answered 503 by the transport for the same reason.
     pub refused_input: AtomicU64,
+    /// Transmits the egress fence refused (each halts the engine).
+    pub fenced: AtomicU64,
 }
 
 /// The application's side of a running engine.
+/// Called by the engine thread whenever events were queued for the
+/// application (an async adapter wakes its task with it).
+pub type EventWaker = Arc<dyn Fn() + Send + Sync>;
+
 pub struct UaHandle {
-    input: SyncSender<Input>,
+    /// One input queue and id allocator per shard.
+    inputs: Vec<SyncSender<Input>>,
+    ids: Vec<IdAllocator>,
+    /// Round robin for new outbound calls.
+    next_shard: AtomicUsize,
     events: Receiver<EventEnvelope>,
-    ids: IdAllocator,
+    waker: Arc<Mutex<Option<EventWaker>>>,
     local: Vec<(Proto, SocketAddr)>,
     stats: Arc<RuntimeStats>,
     stop: Arc<AtomicBool>,
@@ -93,20 +119,55 @@ impl UaHandle {
     /// returned leg/operation are valid at once; if the engine then refuses
     /// the command, a `CommandRejected` event (seq 0) carries the error.
     pub fn submit(&self, mut cmd: UaCommand) -> Result<Accepted, CommandError> {
-        let op = self.ids.op();
-        let leg = match &mut cmd {
-            UaCommand::Originate(o) => *o.leg.get_or_insert_with(|| self.ids.leg()),
-            other => other.leg().ok_or(CommandError::UnknownLeg)?,
+        let n = u32::try_from(self.inputs.len()).unwrap_or(1);
+        let (shard, leg) = match &mut cmd {
+            UaCommand::Originate(o) => {
+                let s = match o.leg {
+                    Some(l) => shard_of_leg(l, n),
+                    None => u32::try_from(self.next_shard.fetch_add(1, Ordering::Relaxed).checked_rem(self.inputs.len()).unwrap_or(0)).unwrap_or(0),
+                };
+                let ids = self.ids.get(s as usize).ok_or(CommandError::UnknownLeg)?;
+                (s, *o.leg.get_or_insert_with(|| ids.leg()))
+            }
+            other => {
+                let l = other.leg().ok_or(CommandError::UnknownLeg)?;
+                (shard_of_leg(l, n), l)
+            }
         };
-        match self.input.try_send(Input::Cmd(op, cmd)) {
+        let (Some(ids), Some(input)) = (self.ids.get(shard as usize), self.inputs.get(shard as usize)) else { return Err(CommandError::UnknownLeg) };
+        let op = ids.op();
+        match input.try_send(Input::Cmd(op, cmd)) {
             Ok(()) => Ok(Accepted { op, leg }),
             Err(TrySendError::Full(_)) => Err(CommandError::Overloaded),
             Err(TrySendError::Disconnected(_)) => Err(CommandError::InvalidState("engine stopped")),
         }
     }
 
+    /// The event channel (blocking receives belong on a thread of the
+    /// application's own, not on an async runtime's worker).
     pub fn events(&self) -> &Receiver<EventEnvelope> {
         &self.events
+    }
+
+    /// The next event if one is ready; never blocks.
+    pub fn try_event(&self) -> Option<EventEnvelope> {
+        self.events.try_recv().ok()
+    }
+
+    /// Be called (from the engine thread) whenever events are queued: an
+    /// async consumer wakes its task (e.g. `tokio::sync::Notify`) and then
+    /// drains `try_event`, so no runtime worker ever blocks on a receive.
+    /// The waker must not block.
+    pub fn set_event_waker(&self, waker: EventWaker) {
+        if let Ok(mut g) = self.waker.lock() {
+            *g = Some(waker);
+        }
+        // Events may already be waiting.
+        if let Ok(g) = self.waker.lock()
+            && let Some(w) = g.as_ref()
+        {
+            w();
+        }
     }
 
     /// The first advertised address (UDP when there is one).
@@ -125,14 +186,34 @@ impl UaHandle {
 
     /// Graceful drain: new calls get 503, established ones continue.
     pub fn drain(&self) {
-        let _ = self.input.send(Input::Drain);
+        for i in &self.inputs {
+            let _ = i.send(Input::Drain);
+        }
+    }
+
+    /// Self-fencing: every engine halts by itself at `until` unless the
+    /// lease is renewed before (see `UaEngine::set_lease` for how to pick
+    /// `until` safely). Renewals only move it forward.
+    pub fn renew_lease(&self, until: Instant) -> Result<(), CommandError> {
+        for i in &self.inputs {
+            // Must not be lost; block briefly rather than drop it.
+            i.send(Input::Lease(until)).map_err(|_| CommandError::InvalidState("engine stopped"))?;
+        }
+        Ok(())
+    }
+
+    /// Engines (shards) behind this handle.
+    pub fn shards(&self) -> usize {
+        self.inputs.len()
     }
 
     /// Stop the engine thread (and the UDP reader). Transport workers of
     /// [`spawn_transport`] live as long as the process, like ferrosip's.
     pub fn shutdown(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        let _ = self.input.send(Input::Shutdown);
+        for i in &self.inputs {
+            let _ = i.send(Input::Shutdown);
+        }
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
@@ -142,32 +223,95 @@ impl UaHandle {
 impl Drop for UaHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        let _ = self.input.try_send(Input::Shutdown);
+        for i in &self.inputs {
+            let _ = i.try_send(Input::Shutdown);
+        }
     }
 }
 
 type SendFn = Box<dyn Fn(&Transmit) -> bool + Send>;
 
-/// Start the engine and resolver threads around `send`.
-fn spawn_engine(cfg: UaConfig, resolver: Box<dyn Resolver>, rt: RuntimeConfig, send: SendFn) -> io::Result<(UaHandle, SyncSender<Input>)> {
-    let ids = IdAllocator::new();
+/// What the engine thread shares with the handle.
+struct Shared {
+    /// The engine clock's origin.
+    start: Instant,
+    waker: Arc<Mutex<Option<EventWaker>>>,
+    fence: Option<EgressFence>,
+    stats: Arc<RuntimeStats>,
+    shard: usize,
+}
+
+/// Start `rt.shards` engine threads (each sending with a `make_send()`)
+/// and one resolver thread. Returns the handle and the shards' inputs.
+fn spawn_engines(
+    cfg: UaConfig,
+    resolver: Box<dyn Resolver>,
+    rt: RuntimeConfig,
+    make_send: &dyn Fn() -> io::Result<SendFn>,
+    stats: Arc<RuntimeStats>,
+) -> io::Result<(UaHandle, Vec<SyncSender<Input>>)> {
+    if cfg.durable {
+        // Durable engines hand out transitions to commit, which this driver
+        // does not do; it would send nothing.
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "durable mode needs a committing driver (see examples/recoverable_ua)"));
+    }
+    let count = rt.shards.max(1);
     let local = cfg.local.clone();
-    let engine = UaEngine::with_entropy(cfg, Box::new(SystemEntropy::default()), ids.clone());
-    let (in_tx, in_rx) = mpsc::sync_channel(rt.input_capacity.max(1));
     let (ev_tx, ev_rx) = mpsc::sync_channel(rt.event_capacity.max(1));
-    let (res_tx, res_rx) = mpsc::sync_channel::<ResolveRequest>(rt.resolve_capacity.max(1));
-    let back = in_tx.clone();
+    let (res_tx, res_rx) = mpsc::sync_channel::<(usize, ResolveRequest)>(rt.resolve_capacity.max(1));
+    let waker: Arc<Mutex<Option<EventWaker>>> = Arc::default();
+    let directory = (count > 1).then(|| Arc::new(crate::shard::DialogDirectory::default()));
+    let (mut inputs, mut ids, mut threads, mut rxs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for i in 0..count {
+        let (in_tx, in_rx) = mpsc::sync_channel(rt.input_capacity.max(1));
+        inputs.push(in_tx);
+        rxs.push(in_rx);
+        ids.push(if count > 1 { IdAllocator::striped(i, count) } else { IdAllocator::new() });
+    }
+    let back = inputs.clone();
     std::thread::Builder::new().name("sip-ua-dns".into()).spawn(move || {
-        for r in res_rx {
+        for (shard, r) in res_rx {
             let out = resolver.resolve(&r);
-            if back.send(Input::Resolved(r.id, out)).is_err() {
+            if back.get(shard).is_none_or(|b| b.send(Input::Resolved(r.id, out)).is_err()) {
                 break;
             }
         }
     })?;
-    let t = std::thread::Builder::new().name("sip-ua".into()).spawn(move || run(engine, in_rx, ev_tx, res_tx, send))?;
-    let handle = UaHandle { input: in_tx.clone(), events: ev_rx, ids, local, stats: Arc::default(), stop: Arc::new(AtomicBool::new(false)), threads: vec![t] };
-    Ok((handle, in_tx))
+    for (i, in_rx) in rxs.into_iter().enumerate() {
+        let index = u32::try_from(i).unwrap_or(0);
+        let shard_cfg = UaConfig { shard: (count > 1).then_some(Shard { index, count }), ..cfg.clone() };
+        let mut engine = UaEngine::with_entropy(shard_cfg, Box::new(SystemEntropy::default()), ids.get(i).cloned().unwrap_or_default());
+        engine.set_epoch(rt.epoch).map_err(|e| io::Error::other(e.to_string()))?;
+        if let Some(d) = &directory {
+            engine.set_dialog_directory(d.clone());
+        }
+        let start = Instant::now();
+        if let Some(until) = rt.lease_until {
+            engine.set_lease(Some(lease_ms(start, until)));
+        }
+        let sh = Shared { start, waker: waker.clone(), fence: rt.egress_fence.clone(), stats: stats.clone(), shard: i };
+        let (ev, res, send) = (ev_tx.clone(), res_tx.clone(), make_send()?);
+        let name = if count > 1 { format!("sip-ua-{i}") } else { "sip-ua".into() };
+        threads.push(std::thread::Builder::new().name(name).spawn(move || run(engine, in_rx, ev, res, send, sh))?);
+    }
+    let handle = UaHandle {
+        inputs: inputs.clone(),
+        ids,
+        next_shard: AtomicUsize::new(0),
+        events: ev_rx,
+        waker,
+        local,
+        stats,
+        stop: Arc::new(AtomicBool::new(false)),
+        threads,
+    };
+    Ok((handle, inputs))
+}
+
+/// Route a received message to its shard's queue.
+fn route<'a>(inputs: &'a [SyncSender<Input>], data: &[u8]) -> Option<&'a SyncSender<Input>> {
+    let n = u32::try_from(inputs.len()).unwrap_or(1);
+    inputs.get(shard_for_message(data, n) as usize)
 }
 
 /// Bind `bind` (UDP) and run an engine on it. When `cfg.local` has no UDP
@@ -181,27 +325,35 @@ pub fn spawn_udp(mut cfg: UaConfig, bind: SocketAddr, resolver: Box<dyn Resolver
         }
         cfg.local.push((Proto::Udp, local));
     }
-    let out = sock.try_clone()?;
-    let send: SendFn = Box::new(move |t| t.dest.proto == Proto::Udp && out.send_to(&t.data, t.dest.addr).is_ok());
-    let (mut handle, input) = spawn_engine(cfg, resolver, rt, send)?;
+    let make_send = || -> io::Result<SendFn> {
+        let out = sock.try_clone()?;
+        Ok(Box::new(move |t: &Transmit| t.dest.proto == Proto::Udp && out.send_to(&t.data, t.dest.addr).is_ok()))
+    };
+    let (mut handle, inputs) = spawn_engines(cfg, resolver, rt, &make_send, Arc::default())?;
     let (stop, stats) = (handle.stop.clone(), handle.stats.clone());
     sock.set_read_timeout(Some(Duration::from_millis(100)))?;
-    let reader = std::thread::Builder::new().name("sip-ua-udp".into()).spawn(move || {
-        let mut buf = vec![0u8; 65_535];
-        while !stop.load(Ordering::Relaxed) {
-            let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
-            let data = buf.get(..n).unwrap_or_default().to_vec();
-            match input.try_send(Input::Packet(data, Dest::new(Proto::Udp, from))) {
-                Ok(()) => {}
-                // UDP: the sender retransmits.
-                Err(TrySendError::Full(_)) => {
-                    stats.dropped_input.fetch_add(1, Ordering::Relaxed);
+    // One reader per shard on the shared socket (the kernel hands each
+    // datagram to one of them); each routes by Call-ID.
+    for r in 0..inputs.len() {
+        let (stop, stats, inputs, sock) = (stop.clone(), stats.clone(), inputs.clone(), sock.try_clone()?);
+        let reader = std::thread::Builder::new().name(format!("sip-ua-udp-{r}")).spawn(move || {
+            let mut buf = vec![0u8; 65_535];
+            while !stop.load(Ordering::Relaxed) {
+                let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
+                let data = buf.get(..n).unwrap_or_default().to_vec();
+                let Some(input) = route(&inputs, &data) else { continue };
+                match input.try_send(Input::Packet(data, Dest::new(Proto::Udp, from))) {
+                    Ok(()) => {}
+                    // UDP: the sender retransmits.
+                    Err(TrySendError::Full(_)) => {
+                        stats.dropped_input.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(TrySendError::Disconnected(_)) => return,
                 }
-                Err(TrySendError::Disconnected(_)) => return,
             }
-        }
-    })?;
-    handle.threads.push(reader);
+        })?;
+        handle.threads.push(reader);
+    }
     Ok(handle)
 }
 
@@ -217,11 +369,13 @@ pub fn spawn_transport(mut cfg: UaConfig, tcfg: &sip_transport::Config, resolver
     // The transport needs its handler before it starts, and the engine needs
     // the transport's send side: connect them through a late-bound slot.
     let net_slot: Arc<Mutex<Option<Arc<sip_transport::Net>>>> = Arc::default();
-    let slot = net_slot.clone();
-    let send: SendFn = Box::new(move |t| {
-        let net = slot.lock().ok().and_then(|g| g.clone());
-        net.is_some_and(|n| n.send(&t.dest, &t.data).is_ok())
-    });
+    let make_send = || -> io::Result<SendFn> {
+        let slot = net_slot.clone();
+        Ok(Box::new(move |t: &Transmit| {
+            let net = slot.lock().ok().and_then(|g| g.clone());
+            net.is_some_and(|n| n.send(&t.dest, &t.data).is_ok())
+        }))
+    };
     // Advertised addresses are known once the listeners are bound; until
     // `spawn_engine` runs the engine has none, so bind first.
     let handler = Arc::new(Front { input: Mutex::new(None), stats: Arc::default() });
@@ -236,10 +390,9 @@ pub fn spawn_transport(mut cfg: UaConfig, tcfg: &sip_transport::Config, resolver
     if let Ok(mut g) = net_slot.lock() {
         *g = Some(net);
     }
-    let (mut handle, input) = spawn_engine(cfg, resolver, rt, send).map_err(|e| e.to_string())?;
-    handle.stats = handler.stats.clone();
+    let (handle, inputs) = spawn_engines(cfg, resolver, rt, &make_send, handler.stats.clone()).map_err(|e| e.to_string())?;
     if let Ok(mut g) = handler.input.lock() {
-        *g = Some(input);
+        *g = Some(inputs);
     }
     Ok(handle)
 }
@@ -248,14 +401,15 @@ pub fn spawn_transport(mut cfg: UaConfig, tcfg: &sip_transport::Config, resolver
 /// input queue (the receive buffer is reused by the worker).
 #[cfg(feature = "transport")]
 struct Front {
-    input: Mutex<Option<SyncSender<Input>>>,
+    input: Mutex<Option<Vec<SyncSender<Input>>>>,
     stats: Arc<RuntimeStats>,
 }
 
 #[cfg(feature = "transport")]
 impl sip_core::Handler for Front {
     fn handle(&self, ctx: &mut sip_core::Ctx<'_, '_>) {
-        let Some(tx) = self.input.lock().ok().and_then(|g| g.clone()) else { return };
+        let Some(inputs) = self.input.lock().ok().and_then(|g| g.clone()) else { return };
+        let Some(tx) = route(&inputs, ctx.msg.buf) else { return };
         match tx.try_send(Input::Packet(ctx.msg.buf.to_vec(), ctx.src)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
@@ -276,21 +430,36 @@ impl sip_core::Handler for Front {
 
     fn transport_event(&self, ev: &sip_core::TransportEvent) {
         let sip_core::TransportEvent::Closed { conn, .. } = ev;
-        if let Some(tx) = self.input.lock().ok().and_then(|g| g.clone()) {
-            // Must not be lost: block briefly rather than drop it.
-            let _ = tx.send(Input::FlowClosed(*conn));
+        if let Some(inputs) = self.input.lock().ok().and_then(|g| g.clone()) {
+            // Must not be lost: block briefly rather than drop it. Every
+            // shard may have dialogs on the flow.
+            for tx in &inputs {
+                let _ = tx.send(Input::FlowClosed(*conn));
+            }
         }
     }
 }
 
-fn run(mut engine: UaEngine, input: Receiver<Input>, events: SyncSender<EventEnvelope>, resolves: SyncSender<ResolveRequest>, send: SendFn) {
-    let start = Instant::now();
+/// An `Instant` on the engine clock (ms since `start`); one already past is `0`.
+fn lease_ms(start: Instant, until: Instant) -> u64 {
+    u64::try_from(until.saturating_duration_since(start).as_millis()).unwrap_or(u64::MAX)
+}
+
+fn run(
+    mut engine: UaEngine,
+    input: Receiver<Input>,
+    events: SyncSender<EventEnvelope>,
+    resolves: SyncSender<(usize, ResolveRequest)>,
+    send: SendFn,
+    sh: Shared,
+) {
+    let start = sh.start;
     let now = || u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     // Events the channel had no room for yet (engine events stay in the
     // engine's bounded queue until this is empty).
     let mut outbox: VecDeque<EventEnvelope> = VecDeque::new();
     // Resolutions the helper had no room for.
-    let mut unresolved: VecDeque<ResolveRequest> = VecDeque::new();
+    let mut unresolved: VecDeque<(usize, ResolveRequest)> = VecDeque::new();
     loop {
         // Wait for input, at most until the next timer; poll quickly while
         // output is backed up.
@@ -310,12 +479,13 @@ fn run(mut engine: UaEngine, input: Receiver<Input>, events: SyncSender<EventEnv
                     let leg = cmd.leg().unwrap_or(UaLegId(0));
                     if let Err(e) = engine.submit_with(op, cmd, now()) {
                         let event = UaEvent::CommandRejected(e);
-                        outbox.push_back(EventEnvelope { leg, seq: 0, generation: Generation(0), op: Some(op), dialog: None, event });
+                        outbox.push_back(EventEnvelope { leg, seq: 0, log_seq: 0, generation: Generation(0), op: Some(op), dialog: None, event });
                     }
                 }
                 Input::Packet(data, src) => engine.handle_message(&data, src, now()),
                 Input::FlowClosed(conn) => engine.handle_flow_closed(&conn),
                 Input::Resolved(id, r) => engine.resolved(id, r, now()),
+                Input::Lease(until) => engine.set_lease(Some(lease_ms(start, until))),
                 Input::Drain => engine.drain(),
                 Input::Shutdown => return,
             }
@@ -331,6 +501,14 @@ fn run(mut engine: UaEngine, input: Receiver<Input>, events: SyncSender<EventEnv
         }
         engine.handle_timeout(now());
         while let Some(t) = engine.poll_transmit() {
+            if let Some(f) = &sh.fence
+                && !f.admits(t.epoch)
+            {
+                // A newer owner exists: nothing more leaves this engine.
+                sh.stats.fenced.fetch_add(1, Ordering::Relaxed);
+                engine.halt();
+                break;
+            }
             if !send(&t)
                 && let Some(id) = t.txn
             {
@@ -338,7 +516,7 @@ fn run(mut engine: UaEngine, input: Receiver<Input>, events: SyncSender<EventEnv
             }
         }
         while let Some(r) = engine.poll_resolve() {
-            unresolved.push_back(r);
+            unresolved.push_back((sh.shard, r));
         }
         while let Some(r) = unresolved.pop_front() {
             match resolves.try_send(r) {
@@ -350,6 +528,7 @@ fn run(mut engine: UaEngine, input: Receiver<Input>, events: SyncSender<EventEnv
                 Err(TrySendError::Disconnected(_)) => return,
             }
         }
+        let mut delivered = false;
         loop {
             let next = match outbox.pop_front() {
                 Some(e) => e,
@@ -359,7 +538,7 @@ fn run(mut engine: UaEngine, input: Receiver<Input>, events: SyncSender<EventEnv
                 },
             };
             match events.try_send(next) {
-                Ok(()) => {}
+                Ok(()) => delivered = true,
                 Err(TrySendError::Full(e)) => {
                     outbox.push_front(e);
                     break;
@@ -367,6 +546,12 @@ fn run(mut engine: UaEngine, input: Receiver<Input>, events: SyncSender<EventEnv
                 // The application is gone: keep running SIP (teardown still works).
                 Err(TrySendError::Disconnected(_)) => {}
             }
+        }
+        if delivered
+            && let Ok(g) = sh.waker.lock()
+            && let Some(w) = g.as_ref()
+        {
+            w();
         }
     }
 }

@@ -69,6 +69,62 @@ test suite passes unchanged.
 | SDP content, RTP ports, codecs, media graph | rtpflux (via the softswitch) |
 | Registration, trunk discovery, ACLs | existing ferrosip modules / adapters |
 
+### Sharding
+
+One engine is one thread and one ordering domain. `RuntimeConfig::shards`
+runs several behind the same listeners (`src/shard.rs`):
+
+- **Routing.** A received message goes to the shard of its Call-ID
+  (FNV-1a of the Call-ID, modulo the count: stable across processes).
+  Every message of a dialog carries the Call-ID, so requests, responses,
+  ACK, CANCEL and retransmissions of a call reach one engine without
+  shared state. A shard generates only Call-IDs that hash to itself
+  (`UaConfig::shard`), so responses to its own requests come back to it.
+- **Commands.** Each shard allocates leg and operation ids from a striped
+  allocator (shard *i* of *n*: *i*+1, *i*+1+*n*, …): a command goes to
+  `shard_of_leg(leg)` with no lookup table. New outbound calls are spread
+  round robin.
+- **Across shards.** An INVITE with `Replaces` is routed by its own
+  Call-ID (the dialog it creates must live where its later requests
+  arrive); the replaced dialog is found in a shared `DialogDirectory`,
+  where each shard lists its dialogs with a live role/phase cell, and the
+  RFC 3891 checks run against that. Flow closures go to every shard.
+- **Events** of all shards arrive on one channel (`seq` per leg, `log_seq`
+  per shard); one DNS thread serves all shards; the UDP front end runs one
+  reader per shard on the shared socket.
+- **Durable shards** (recovery): one journal per shard, each restored with
+  its striped allocator and the same shard count, then
+  `set_dialog_directory` republishes its dialogs. Changing the count moves
+  Call-IDs between shards: not supported for live or journaled calls.
+
+Tests: `tests/runtime_udp.rs` — 120 calls between two 4-shard runtimes
+over UDP (answered, cancelled while ringing, hung up), every event's leg
+on its Call-ID's shard; attended transfer into a 4-shard runtime where
+the `Replaces` INVITE and the replaced dialog are on different shards
+(the replaced leg is reported; the new dialog's BYE reaches it); both
+routing rules were checked by mutation (no directory; routing by the
+replaced Call-ID) and fail the test. `tests/recovery.rs`: a restored
+durable shard keeps striped ids and own-shard Call-IDs and republishes
+its dialogs.
+
+Scaling (`examples/bench_shards`, two runtimes on loopback UDP with
+their application threads, 20 000 calls, 500 in flight, Xeon E5-1620 v3
+4 cores / 8 threads, three runs):
+
+| Shards per runtime | Calls/s |
+|---|---|
+| 1 | 15 001 – 16 606 |
+| 2 | 19 829 – 21 038 |
+| 4 | 16 795 – 26 478 |
+
+The first run of this benchmark had a single UDP reader per runtime and
+did not scale at all (1, 2 and 4 shards all ≈ 15–17 k calls/s); one
+reader per shard fixed that. At 4 shards both runtimes, their readers
+and both application threads (≈ 20 busy threads) share 4 cores, so the
+numbers spread widely; this setup cannot show more than that sharding
+removes the single-engine limit. Measure on the target machine with the
+peer elsewhere.
+
 ## 3. Failure strategies
 
 | Situation | Engine behaviour |
@@ -234,6 +290,11 @@ leg keeps for re-INVITE refreshes; boxing the rarely used parts lazily is
 the next step if it matters. (Profiling with perf was not possible on the
 development machine: `perf_event_paranoid` = 4.)
 
+Recoverable state (`docs/sip-ua-recovery.md`): in memory mode, the
+outcome tombstones and operation records it added cost −2.5 % call rate
+and +0.4 % memory against the commit before it (A/B, interleaved); the
+cost of durable mode itself is measured there (§8b).
+
 The proxy was not modified, so the proxy before/after comparison the
 specification asks for (≥5 % median throughput or ≥10 % p99 regression
 gate) has nothing to measure yet; it applies when the worker-integrated
@@ -256,6 +317,8 @@ Done:
   privacy by policy, SIP INFO DTMF with the RTP-DTMF flag, registrar
   (usrloc) and trunk routing adapters, mod-ai migrated;
 - interop with independent UAs (Python, UDP and TCP), fuzzing, benchmarks.
+- RFC 6086 Info Packages; sharding by Call-ID (§2); recoverable state,
+  ownership fencing and leases (`docs/sip-ua-recovery.md`).
 
 Not done:
 
@@ -263,9 +326,9 @@ Not done:
    installed where this was developed); `tc netem` impaired-UDP runs;
    packet-capture assertions; long soak; the scenario suite over TCP/TLS
    (the simulated scenarios are UDP; reliable transports have loopback tests).
-2. RFC 6086 Info Packages (`Recv-Info` negotiation); offers inside PRACK;
+2. Offers inside PRACK;
    early UPDATE from a UAC with several early dialogs; REFER outside a
    dialog and multiple concurrent REFER subscriptions per dialog.
-3. Several engines sharded by Call-ID behind one transport; a proxy
-   before/after benchmark once something in the proxy path changes.
+3. A proxy before/after benchmark once something in the proxy path
+   changes. (Sharding by Call-ID: done, see §2.)
 4. **P2**: recoverable state, cluster ownership.

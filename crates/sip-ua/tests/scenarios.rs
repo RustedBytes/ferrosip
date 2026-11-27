@@ -532,6 +532,7 @@ fn info_is_delivered_and_completed() {
                 content_type: "application/dtmf-relay".into(),
                 body: b"Signal=5\r\nDuration=160\r\n".to_vec(),
                 headers: vec![],
+                package: None,
             }),
         )
         .unwrap()
@@ -542,9 +543,9 @@ fn info_is_delivered_and_completed() {
     assert_eq!(i.content_type.as_deref(), Some("application/dtmf-relay"));
     assert_eq!(i.body, b"Signal=5\r\nDuration=160\r\n");
     // Reserved headers are refused.
-    let bad = InfoRequest { leg: a, content_type: "text/plain".into(), body: vec![], headers: vec![Header::new("Call-ID", "x")] };
+    let bad = InfoRequest { leg: a, content_type: "text/plain".into(), body: vec![], headers: vec![Header::new("Call-ID", "x")], package: None };
     assert!(matches!(net.submit(0, UaCommand::SendInfo(bad)), Err(CommandError::InvalidArgument(_))));
-    let bad = InfoRequest { leg: a, content_type: "text/plain".into(), body: vec![], headers: vec![Header::new("X-A", "1\r\nInjected: 1")] };
+    let bad = InfoRequest { leg: a, content_type: "text/plain".into(), body: vec![], headers: vec![Header::new("X-A", "1\r\nInjected: 1")], package: None };
     assert!(matches!(net.submit(0, UaCommand::SendInfo(bad)), Err(CommandError::InvalidArgument(_))));
 }
 

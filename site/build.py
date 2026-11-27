@@ -20,7 +20,7 @@ ASSETS = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")
 # The guide's order; everything else is grouped below by where it lives.
 USING = ["docs/running.md", "docs/config-toml.md", "docs/fsr.md", "docs/script.md", "docs/import.md", "docs/lint.md", "docs/sip.md", "docs/kamailio-compat.md"]
 REFERENCE = ["docs/modules-overview.md", "docs/modules-reference.md", "docs/functions-reference.md", "docs/lints-reference.md", "docs/glossary.md"]
-INTERNALS = ["docs/architecture.md", "docs/design-notes.md", "docs/sip-ua.md", "docs/sip-ua-rfc-matrix.md", "docs/testing.md", "docs/benchmarks.md", "bench/BASELINE.md", "tests/compat/README.md"]
+INTERNALS = ["docs/architecture.md", "docs/design-notes.md", "docs/sip-ua.md", "docs/sip-ua-rfc-matrix.md", "docs/sip-ua-recovery.md", "docs/testing.md", "docs/benchmarks.md", "bench/BASELINE.md", "tests/compat/README.md"]
 
 LINK = re.compile(r"(!?\[(?:[^\[\]]|\[[^\[\]]*\])*\]\()(<[^>]*>|[^)\s]+)((?:\s+\"[^\"]*\")?\))")
 HTML_ATTR = re.compile(r"""(\b(?:src|href)=")([^"]+)(")""")

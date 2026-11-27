@@ -10,6 +10,7 @@ use super::*;
 
 /// Per-leg session timer state.
 #[derive(Debug, Default)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub(super) struct SessionTimer {
     /// Negotiated interval in seconds; None: no session timer.
     pub(super) interval: Option<u32>,

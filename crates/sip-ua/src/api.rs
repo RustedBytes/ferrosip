@@ -49,6 +49,7 @@ pub struct OriginateRequest {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProvisionalRequest {
     pub leg: UaLegId,
     /// 101..=199 (100 is sent by the engine itself).
@@ -122,6 +123,9 @@ pub struct InfoRequest {
     pub content_type: String,
     pub body: Vec<u8>,
     pub headers: Vec<Header>,
+    /// RFC 6086 Info Package (`Info-Package`); must be one the peer listed
+    /// in `Recv-Info` (`LegSnapshot::peer_recv_info`). `None`: legacy INFO.
+    pub package: Option<String>,
 }
 
 /// Answer the outstanding remote offer (or supply the offer a body-less
@@ -225,6 +229,12 @@ pub enum CommandError {
     Draining,
     /// No advertised address for the transport.
     NoLocalAddress,
+    /// `submit_keyed`: the key was used for another command.
+    KeyConflict,
+    /// An owner epoch older than the current one.
+    StaleEpoch,
+    /// The engine stopped (lost ownership, or a durable commit failed).
+    Halted,
 }
 
 impl std::fmt::Display for CommandError {
@@ -237,11 +247,13 @@ impl std::error::Error for CommandError {}
 
 /// A new inbound INVITE (a new UAS leg).
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct InboundInvite {
     pub request_uri: String,
     pub from: String,
     pub to: String,
     pub call_id: String,
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::dest_serde"))]
     pub source: Dest,
     /// Every header of the INVITE, for the application's policy (trusted
     /// identity headers are only trustworthy from trusted sources).
@@ -262,6 +274,7 @@ pub struct InboundInvite {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProvisionalEvent {
     pub status: SipStatus,
     /// The early dialog's remote tag (forked early dialogs differ).
@@ -271,6 +284,7 @@ pub struct ProvisionalEvent {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct AcceptedEvent {
     pub status: SipStatus,
     /// Answer to our offer, or the remote offer (then `RemoteOffer` follows).
@@ -278,12 +292,14 @@ pub struct AcceptedEvent {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct AckEvent {
     /// The answer, when our 2xx carried an offer.
     pub sdp: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub enum OfferKind {
     /// Offer in a 2xx to our body-less INVITE: the answer goes in the ACK.
     InviteResponse,
@@ -295,6 +311,7 @@ pub enum OfferKind {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct RemoteOfferEvent {
     pub kind: OfferKind,
     /// None: a body-less re-INVITE; respond with an offer.
@@ -305,12 +322,17 @@ pub struct RemoteOfferEvent {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct ByeEvent {
     pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct InfoEvent {
+    /// RFC 6086 Info Package (one we accept), or `None` for legacy INFO.
+    #[cfg_attr(feature = "recovery", serde(default))]
+    pub package: Option<String>,
     pub content_type: Option<String>,
     pub body: Vec<u8>,
     pub headers: Vec<Header>,
@@ -323,6 +345,7 @@ pub struct InfoEvent {
 
 /// An operation (Negotiate, SendInfo) finished.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct CompletedEvent {
     pub status: SipStatus,
     /// The answer to our offer (Negotiate).
@@ -330,6 +353,7 @@ pub struct CompletedEvent {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct FailureEvent {
     pub cause: Cause,
     /// The leg is being torn down (a `Terminated` follows) or only the
@@ -340,12 +364,14 @@ pub struct FailureEvent {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct TerminationEvent {
     pub cause: Cause,
 }
 
 /// The peer asks us to call someone (RFC 3515). Answer with `RespondToRefer`.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct ReferEvent {
     /// The Refer-To value as received.
     pub refer_to: String,
@@ -361,6 +387,7 @@ pub struct ReferEvent {
 
 /// Progress of our REFER, from the peer's NOTIFY.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct ReferProgressEvent {
     /// The status line of the `message/sipfrag` body.
     pub status: SipStatus,
@@ -369,6 +396,7 @@ pub struct ReferProgressEvent {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub enum UaEvent {
     IncomingInvite(InboundInvite),
     Provisional(ProvisionalEvent),
@@ -385,7 +413,9 @@ pub enum UaEvent {
     Failed(FailureEvent),
     /// The leg is gone; always the last event of a leg, emitted exactly once.
     Terminated(TerminationEvent),
-    /// A command submitted through a non-blocking handle was refused.
+    /// A command submitted through a non-blocking handle was refused
+    /// (produced by runtime handles only, never journaled).
+    #[cfg_attr(feature = "recovery", serde(skip))]
     CommandRejected(CommandError),
 }
 
@@ -398,11 +428,14 @@ impl UaEvent {
 
 /// An event with its correlation data.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct EventEnvelope {
     pub leg: UaLegId,
     /// Monotonic per leg, starting at 1; a gap means events were missed
     /// (reconcile with `UaEngine::snapshot`).
     pub seq: u64,
+    /// Engine-wide sequence of all events (replay position).
+    pub log_seq: u64,
     pub generation: Generation,
     /// The operation this event completes or answers, if any.
     pub op: Option<OperationId>,

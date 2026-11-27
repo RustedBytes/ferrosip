@@ -64,6 +64,7 @@ jobs:
             e2e:
               - *rust
               - tests/**
+              - interop/**
             deps:
               - "**/Cargo.toml"
               - Cargo.lock
@@ -158,10 +159,12 @@ jobs:
           # sip-ua: without ferrosip's transports, and with the usrloc adapter.
           cargo clippy --release -p sip-ua --no-default-features -- -D warnings
           cargo clippy --release -p sip-ua --all-targets --features location -- -D warnings
+          cargo clippy --release -p sip-ua --all-targets --features recovery -- -D warnings
       # Test certificates (gitignored) for the TLS unit tests.
       - run: etc/tls/gen-certs.sh
       - run: cargo test --release --workspace --features ferrosip/db-all
       - run: cargo test --release -p sip-ua --features location --test routing_location
+      - run: cargo test --release -p sip-ua --features recovery
       - name: Script formatting
         run: target/release/ferroctl fmt --check etc/ferrosip.cfg
       - name: Kamailio configs (ferrosip -c)
@@ -273,6 +276,8 @@ jobs:
       - run: cargo build --release --workspace --features ferrosip/db-all
       # The sip-ua example B2BUA (tests/e2e_sip_ua.py).
       - run: cargo build --release -p sip-ua --example b2bua
+      # The durable UA for tests/e2e_sip_ua_recovery.py.
+      - run: cargo build --release -p sip-ua --features recovery --example recoverable_ua
       # rtpflux, pinned to a commit: move the pin to take a newer version.
       - name: Check out rtpflux (the media relay e2e_rtpflux runs behind the rtpengine module)
         uses: actions/checkout@v7
@@ -285,6 +290,22 @@ jobs:
           git -C rtpflux log -1 --format='rtpflux %h %s'
           cargo build --release --manifest-path rtpflux/Cargo.toml -p rtpflux
           echo "RTPFLUX=$PWD/rtpflux/target/release/rtpflux" >> "$GITHUB_ENV"
+      # sip-ua with real media (tests/e2e_sip_ua_rtpflux.py): the native API
+      # client and relay at the revision interop/sip-ua-rtpflux pins. The
+      # suite fails (does not skip) when either binary is missing.
+      - name: Check out rtpflux (native API, for sip-ua's media crash tests)
+        uses: actions/checkout@v7
+        with:
+          repository: RustedBytes/rtpflux
+          ref: cac94112d993ae1e61614b0c4bbb8e416d45059c
+          path: rtpflux-native
+      - name: Build rtpflux (native API) and the sip-ua media B2BUA
+        run: |
+          git -C rtpflux-native log -1 --format='rtpflux %h %s'
+          cargo build --release --manifest-path rtpflux-native/Cargo.toml -p rtpflux
+          echo "RTPFLUX_BIN=$PWD/rtpflux-native/target/release/rtpflux" >> "$GITHUB_ENV"
+          cargo clippy --release --manifest-path interop/sip-ua-rtpflux/Cargo.toml -- -D warnings
+          cargo build --release --manifest-path interop/sip-ua-rtpflux/Cargo.toml
       - name: e2e suites
         # Root: e2e_sqldb runs the database servers as postgres/root and
         # e2e_ims installs kernel IPsec SAs (ip xfrm needs CAP_NET_ADMIN).

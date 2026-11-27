@@ -13,6 +13,7 @@ use std::fmt;
 
 /// A SIP method (owned; unknown methods keep their name).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub enum Method {
     Invite,
     Ack,
@@ -82,6 +83,7 @@ impl fmt::Display for Method {
 
 /// One header line (name as written, value trimmed).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct Header {
     pub name: String,
     pub value: String,
@@ -94,6 +96,7 @@ impl Header {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub enum StartLine {
     Request { method: Method, uri: String },
     Response { code: u16, reason: String },
@@ -173,10 +176,12 @@ impl ViaInfo {
 
 /// An owned SIP request or response.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct SipMessage {
     pub start: StartLine,
     /// Every header except Content-Length (recomputed on serialization).
     pub headers: Vec<Header>,
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::bytes_serde"))]
     pub body: Vec<u8>,
 }
 

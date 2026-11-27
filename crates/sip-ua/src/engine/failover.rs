@@ -10,8 +10,10 @@
 use super::*;
 
 #[derive(Debug, Default)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub(super) struct Failover {
     /// Targets not tried yet, in order.
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::dest_serde::vec"))]
     pub(super) alternatives: Vec<Dest>,
     /// Any response to the current INVITE (stops the no-response probe).
     pub(super) responded: bool,

@@ -4,12 +4,14 @@ use std::fmt;
 
 /// A final SIP status as received (or sent).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct SipStatus {
     pub code: u16,
     pub reason: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub enum CauseKind {
     /// The peer answered with a final non-2xx (or sent BYE with a Reason).
     SipResponse,
@@ -41,6 +43,7 @@ pub enum CauseKind {
 
 /// Terminal or failure cause: kind, Q.850 mapping and the original status.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cause {
     pub kind: CauseKind,
     /// The SIP status that caused it (received or locally generated).

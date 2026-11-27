@@ -15,6 +15,7 @@ use std::collections::VecDeque;
 
 /// UAC: one early dialog (one per remote tag of the INVITE's 1xx).
 #[derive(Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub(super) struct EarlyDialog {
     pub(super) tag: String,
     pub(super) remote_hdr: String,
@@ -26,9 +27,12 @@ pub(super) struct EarlyDialog {
 
 /// UAS: our reliable provisional awaiting its PRACK.
 #[derive(Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub(super) struct Reliable {
     rseq: u32,
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::bytes_serde::arc"))]
     bytes: Arc<[u8]>,
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::dest_serde"))]
     dest: Dest,
     interval: u64,
     /// It carried our offer: the PRACK must answer it.
@@ -37,6 +41,7 @@ pub(super) struct Reliable {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub(super) enum PeerRel {
     #[default]
     No,
@@ -45,6 +50,7 @@ pub(super) enum PeerRel {
 }
 
 #[derive(Debug, Default)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub(super) struct Prack {
     /// UAS: the caller's 100rel support.
     pub(super) peer: PeerRel,
@@ -225,7 +231,7 @@ impl UaEngine {
                 leg.stable_generation = leg.generation;
             }
         }
-        leg.phase = Phase::Early;
+        leg.set_phase(Phase::Early);
         Ok(())
     }
 

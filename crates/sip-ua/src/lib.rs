@@ -16,23 +16,31 @@ pub mod auth;
 pub mod cause;
 pub mod dtmf;
 pub mod engine;
+pub mod fence;
 pub mod identity;
 pub mod ids;
 pub mod msg;
+#[cfg(feature = "recovery")]
+pub mod recovery;
 pub mod refer;
 pub mod routing;
 pub mod runtime;
 pub mod sdp;
+pub mod shard;
 pub mod txn;
 
 pub use api::*;
 pub use auth::Credentials;
 pub use cause::{Cause, CauseKind, SipStatus};
 pub use dtmf::Dtmf;
-pub use engine::{LegSnapshot, OfferState, Phase, ResolveRequest, Role, Transmit, UaConfig, UaEngine, UaStats};
+pub use engine::{
+    KeyedAccepted, LegOutcome, LegSnapshot, OfferState, OpRecord, OpStatus, Phase, ResolveRequest, Role, Tombstone, Transmit, UaConfig, UaEngine, UaStats,
+};
+pub use fence::EgressFence;
 pub use identity::TrustPolicy;
 pub use ids::{Entropy, Generation, IdAllocator, OperationId, SeededEntropy, SipDialogId, SystemEntropy, TxnId, UaLegId};
 pub use msg::{Header, Limits, Method, SipMessage};
 pub use refer::Replaces;
+pub use shard::Shard;
 pub use sip_core::{Dest, Proto};
 pub use txn::TimerConfig;

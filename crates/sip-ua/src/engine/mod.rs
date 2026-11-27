@@ -26,7 +26,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 mod failover;
+mod graves;
 mod prack;
+#[cfg(feature = "recovery")]
+pub(crate) mod recovery;
 mod redirect;
 mod refer;
 mod session_timer;
@@ -82,6 +85,23 @@ pub struct UaConfig {
     /// inbound INVITE by Call-ID, From tag, CSeq and top-Via sent-by, the
     /// RFC 2543 way. Off: such an INVITE gets 482, such a CANCEL 481.
     pub lenient_matching: bool,
+    /// Durable mode (feature `recovery`): effects leave the engine only as
+    /// `Transition`s (`take_transition`), to be committed before dispatch;
+    /// `poll_transmit` / `poll_event` return nothing.
+    pub durable: bool,
+    /// This engine is one shard of several behind one address: it only
+    /// generates Call-IDs that route to itself (`crate::shard`).
+    pub shard: Option<crate::shard::Shard>,
+    /// RFC 6086: the Info Packages we accept, advertised as `Recv-Info` in
+    /// INVITE, re-INVITE and UPDATE and in our 18x/2xx to them; an INFO for
+    /// another package is answered 469. `None`: the framework is not used
+    /// (no `Recv-Info`; INFO with a package is refused with 469, legacy
+    /// INFO without `Info-Package` is accepted either way).
+    pub recv_info: Option<Vec<String>>,
+    /// Ended legs remembered for `leg_outcome` (oldest dropped first).
+    pub max_tombstones: usize,
+    /// Keyed operations remembered for `submit_keyed` / `op_outcome`.
+    pub max_op_records: usize,
 }
 
 impl Default for UaConfig {
@@ -106,6 +126,11 @@ impl Default for UaConfig {
             trust: crate::identity::TrustPolicy::default(),
             max_early_dialogs: 16,
             lenient_matching: false,
+            durable: false,
+            shard: None,
+            recv_info: None,
+            max_tombstones: 10_000,
+            max_op_records: 100_000,
         }
     }
 }
@@ -141,11 +166,18 @@ const RESERVED: &[&str] = &[
 
 /// One message for the driver to send.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct Transmit {
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::dest_serde"))]
     pub dest: Dest,
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::bytes_serde::arc"))]
     pub data: Arc<[u8]>,
     /// Report a send failure with [`UaEngine::handle_send_error`].
     pub txn: Option<TxnId>,
+    /// The owner epoch it was produced under: a fenced driver drops it when
+    /// a newer owner has taken over.
+    #[cfg_attr(feature = "recovery", serde(default))]
+    pub epoch: u64,
 }
 
 /// A host the driver must resolve (RFC 3263) off the hot path.
@@ -161,12 +193,14 @@ pub struct ResolveRequest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub enum Role {
     Uac,
     Uas,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub enum Phase {
     /// UAC: INVITE sent, nothing but 100 received. UAS: no 1xx sent yet.
     Calling,
@@ -203,6 +237,8 @@ pub struct LegSnapshot {
     pub remote_target: String,
     /// RFC 4028: (interval seconds, we are the refresher).
     pub session_timer: Option<(u32, bool)>,
+    /// RFC 6086: Info Packages the peer accepts (its latest `Recv-Info`).
+    pub peer_recv_info: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -222,17 +258,21 @@ pub struct UaStats {
     /// 1xx ignored because their leg had `max_early_dialogs` already.
     pub early_dialogs_dropped: u64,
     pub events_shed: u64,
+    /// The engine halted because its ownership lease ran out.
+    pub lease_lapsed: bool,
 }
 
 // ------------------------------------------------------------- internals --
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 struct ClientKey {
     branch: String,
     method: Method,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 struct ServerKey {
     branch: String,
     sent_by: String,
@@ -240,12 +280,14 @@ struct ServerKey {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 enum TxnKey {
     Client(ClientKey),
     Server(ServerKey),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 enum Purpose {
     /// The leg's initial INVITE (client or server).
     Invite(UaLegId),
@@ -263,6 +305,7 @@ enum Purpose {
     Detached,
 }
 
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 struct TxnEntry {
     txn: Txn,
     purpose: Purpose,
@@ -270,6 +313,7 @@ struct TxnEntry {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 enum LegTimer {
     /// UAS: retransmit the 2xx until ACK (RFC 3261 §13.3.1.4).
     Retransmit2xx,
@@ -307,6 +351,7 @@ enum TimerRef {
 
 /// Where an offer/answer exchange is carried.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 enum OfferVia {
     /// Our offer in the initial INVITE.
     Invite,
@@ -323,6 +368,7 @@ enum OfferVia {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 enum Oa {
     Stable,
     LocalOffer(OfferVia, Option<OperationId>),
@@ -330,6 +376,7 @@ enum Oa {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 enum CancelState {
     None,
     /// Asked to cancel before any provisional arrived (RFC 3261 §9.1).
@@ -337,15 +384,24 @@ enum CancelState {
     Sent,
 }
 
+/// The ACK of a 2xx: (CSeq, bytes, destination).
+type AckCache = (u32, Arc<[u8]>, Dest);
+/// A forked 2xx we ACKed and ended: (To tag, ACK bytes, destination).
+type KilledFork = (String, Arc<[u8]>, Dest);
+
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 struct Pending2xx {
     cseq: u32,
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::bytes_serde::arc"))]
     bytes: Arc<[u8]>,
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::dest_serde"))]
     dest: Dest,
     interval: u64,
 }
 
 /// Leg state added by protocol extensions.
 #[derive(Debug, Default)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 struct LegExt {
     st: SessionTimer,
     rel: Prack,
@@ -355,11 +411,17 @@ struct LegExt {
     /// The peer's latest SDP offered RFC 4733 telephone-event.
     rtp_dtmf: bool,
     /// The SDP we last sent as an offer or answer (session refresh re-INVITEs).
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::bytes_serde::opt_vec"))]
     local_sdp: Option<Vec<u8>>,
     /// Our offer in a pending `Negotiate`; becomes `local_sdp` when answered.
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::bytes_serde::opt_vec"))]
     offered_sdp: Option<Vec<u8>>,
+    /// The cause of the leg's `Terminated` event, for its tombstone.
+    #[cfg_attr(feature = "recovery", serde(default))]
+    end_cause: Option<Box<Cause>>,
 }
 
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 struct Leg {
     id: UaLegId,
     role: Role,
@@ -377,25 +439,38 @@ struct Leg {
     local_cseq: u32,
     remote_cseq: Option<u32>,
     /// Connection affinity (reliable transports): in-dialog requests reuse it.
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::dest_serde::opt"))]
     flow: Option<Dest>,
+    /// Role and phase as other shards see them (sharded runtimes only).
+    #[cfg_attr(feature = "recovery", serde(skip))]
+    status: Option<std::sync::Arc<crate::shard::LegStatus>>,
+    /// RFC 6086: the packages the peer's latest `Recv-Info` listed (`None`:
+    /// it never sent one).
+    #[cfg_attr(feature = "recovery", serde(default))]
+    peer_recv_info: Option<Vec<String>>,
     secure: bool,
     invite_txn: Option<TxnId>,
     /// UAC: the INVITE without Via/CSeq/auth, to rebuild for auth retries.
     invite_template: Option<SipMessage>,
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::dest_serde::opt"))]
     invite_dest: Option<Dest>,
     /// UAC: early dialogs (forks) seen so far.
     early: Vec<EarlyDialog>,
     /// 2xx from forks we did not keep: (tag, ACK bytes, dest) to re-ACK retransmissions.
-    killed: Vec<(String, Arc<[u8]>, Dest)>,
+    #[cfg_attr(feature = "recovery", serde(with = "recovery::killed_serde"))]
+    killed: Vec<KilledFork>,
     oa: Oa,
     negotiated: bool,
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::bytes_serde::opt_vec"))]
     early_answer: Option<Vec<u8>>,
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::bytes_serde::opt_vec"))]
     remote_offer: Option<Vec<u8>>,
     generation: u64,
     stable_generation: u64,
     seq: u64,
     /// UAC: the ACK of the last 2xx (cseq, bytes, dest).
-    ack: Option<(u32, Arc<[u8]>, Dest)>,
+    #[cfg_attr(feature = "recovery", serde(with = "recovery::ack_serde"))]
+    ack: Option<AckCache>,
     /// UAC: 2xx (cseq) whose ACK waits for the application's answer.
     ack_wait: Option<u32>,
     pending_2xx: Option<Pending2xx>,
@@ -411,11 +486,13 @@ struct Leg {
     /// UAS: BYE as soon as the 2xx is ACKed.
     bye_after_ack: Option<Option<String>>,
     bye_cause: Option<Cause>,
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::creds_serde"))]
     creds: Option<Credentials>,
     auth_attempts: u8,
     timers: Vec<(LegTimer, u64)>,
     origin_op: Option<OperationId>,
     /// Non-critical events could not be queued: shed this leg.
+    #[cfg_attr(feature = "recovery", serde(skip))]
     overloaded: bool,
     /// Merged-request key (UAS).
     merged_key: Option<(String, String, u32)>,
@@ -425,6 +502,14 @@ struct Leg {
 }
 
 impl Leg {
+    /// Every phase change goes through here (other shards may watch it).
+    fn set_phase(&mut self, p: Phase) {
+        self.phase = p;
+        if let Some(s) = &self.status {
+            s.set(self.role, p);
+        }
+    }
+
     fn dialog_id(&self) -> Option<SipDialogId> {
         Some(SipDialogId { call_id: self.call_id.clone(), local_tag: self.local_tag.clone(), remote_tag: self.remote_tag.clone()? })
     }
@@ -451,6 +536,7 @@ impl Leg {
     }
 }
 
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 struct PendingResolve {
     leg: UaLegId,
     req: SipMessage,
@@ -562,6 +648,7 @@ fn reason_text(code: u16) -> &'static str {
         486 => "Busy Here",
         487 => "Request Terminated",
         488 => "Not Acceptable Here",
+        469 => "Bad Info Package",
         491 => "Request Pending",
         500 => "Server Internal Error",
         501 => "Not Implemented",
@@ -625,6 +712,11 @@ pub struct UaEngine {
     timer_seq: u64,
     legs: HashMap<UaLegId, Leg>,
     dialogs: HashMap<(String, String, String), UaLegId>,
+    /// Sharded runtime: the dialogs of all shards (`Replaces` across shards).
+    directory: Option<std::sync::Arc<crate::shard::DialogDirectory>>,
+    /// Ownership lease: at this engine-clock time the engine halts by
+    /// itself (`set_lease`). Not persisted.
+    lease_until: Option<u64>,
     merged: HashMap<(String, String, u32), UaLegId>,
     txns: HashMap<TxnId, TxnEntry>,
     client_keys: HashMap<ClientKey, TxnId>,
@@ -636,6 +728,97 @@ pub struct UaEngine {
     pending_resolve: HashMap<u64, PendingResolve>,
     draining: bool,
     stats: UaStats,
+    /// Engine-wide event sequence (`EventEnvelope::log_seq`).
+    event_seq: u64,
+    /// Owner epoch (0: single-node, no fencing).
+    epoch: u64,
+    /// Keyed operations (`submit_keyed`) and their outcomes.
+    ops: HashMap<String, OpRecord>,
+    op_keys: HashMap<OperationId, String>,
+    /// Ended legs, oldest first.
+    tombstones: graves::Graves,
+    /// Durable-mode bookkeeping: what changed since the last transition.
+    jr: Journal,
+}
+
+/// Status of a keyed operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
+pub enum OpStatus {
+    /// Accepted; no protocol outcome yet.
+    Accepted,
+    /// The leg is answered (Originate) or the operation completed.
+    Completed {
+        code: u16,
+    },
+    Failed {
+        cause: Cause,
+    },
+    /// The leg ended.
+    Ended {
+        cause: Cause,
+    },
+}
+
+/// A keyed operation as recorded.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpRecord {
+    pub key: String,
+    /// Hash of the command's semantic parameters (`submit_keyed`).
+    pub fingerprint: u64,
+    pub op: OperationId,
+    pub leg: UaLegId,
+    pub status: OpStatus,
+}
+
+/// What `submit_keyed` did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyedAccepted {
+    pub op: OperationId,
+    pub leg: UaLegId,
+    /// The key was already known with the same command: nothing new was
+    /// done (no second INVITE); `status` is its outcome so far.
+    pub replayed: bool,
+    pub status: OpStatus,
+}
+
+/// An ended leg, kept for a while so a consumer that missed its events can
+/// learn the outcome (cause kind, SIP status, Q.850 and detail; not a 3xx's
+/// contacts).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
+pub struct Tombstone {
+    pub leg: UaLegId,
+    pub call_id: String,
+    pub dialog: Option<SipDialogId>,
+    pub cause: Cause,
+    /// Sequence number of the leg's last event (its `Terminated`).
+    pub last_seq: u64,
+}
+
+#[derive(Clone, Debug)]
+pub enum LegOutcome {
+    Active(LegSnapshot),
+    Ended(Tombstone),
+    /// Never known here, or forgotten (retention passed).
+    Unknown,
+}
+
+/// Durable-mode change tracking.
+#[derive(Debug, Default)]
+struct Journal {
+    #[cfg_attr(not(feature = "recovery"), allow(dead_code, reason = "journal positions are only handed out with the recovery feature"))]
+    seq: u64,
+    legs: std::collections::BTreeSet<UaLegId>,
+    txns: std::collections::BTreeSet<TxnId>,
+    txns_removed: std::collections::BTreeSet<TxnId>,
+    ops: std::collections::BTreeSet<String>,
+    ops_removed: std::collections::BTreeSet<String>,
+    tombstones: std::collections::BTreeSet<UaLegId>,
+    tombstones_removed: std::collections::BTreeSet<UaLegId>,
+    /// A commit failed or ownership was revoked: no more effects.
+    halted: bool,
 }
 
 impl UaEngine {
@@ -654,6 +837,8 @@ impl UaEngine {
             timer_seq: 0,
             legs: HashMap::new(),
             dialogs: HashMap::new(),
+            directory: None,
+            lease_until: None,
             merged: HashMap::new(),
             txns: HashMap::new(),
             client_keys: HashMap::new(),
@@ -665,6 +850,12 @@ impl UaEngine {
             pending_resolve: HashMap::new(),
             draining: false,
             stats: UaStats::default(),
+            event_seq: 0,
+            epoch: 0,
+            ops: HashMap::new(),
+            op_keys: HashMap::new(),
+            tombstones: graves::Graves::default(),
+            jr: Journal::default(),
         }
     }
 
@@ -678,12 +869,141 @@ impl UaEngine {
 
     // ------------------------------------------------------------ output --
 
+    /// The next message to send. Nothing in durable mode: use `take_transition`.
     pub fn poll_transmit(&mut self) -> Option<Transmit> {
+        if self.cfg.durable || self.jr.halted {
+            return None;
+        }
         self.transmits.pop_front()
     }
 
+    /// The next event. Nothing in durable mode: use `take_transition`.
     pub fn poll_event(&mut self) -> Option<EventEnvelope> {
+        if self.cfg.durable {
+            return None;
+        }
         self.events.pop_front()
+    }
+
+    // ------------------------------------------- outcomes and ownership --
+
+    /// A leg's state, or its outcome once ended (while remembered).
+    pub fn leg_outcome(&self, leg: UaLegId) -> LegOutcome {
+        if let Some(s) = self.snapshot(leg) {
+            return LegOutcome::Active(s);
+        }
+        self.tombstones.get(leg).map_or(LegOutcome::Unknown, LegOutcome::Ended)
+    }
+
+    /// The operation submitted with `key`, if remembered.
+    pub fn op_outcome(&self, key: &str) -> Option<OpRecord> {
+        self.ops.get(key).cloned()
+    }
+
+    /// The owner epoch every transmit and transition is stamped with.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Take ownership under `epoch` (from the external authority). It may
+    /// only grow.
+    pub fn set_epoch(&mut self, epoch: u64) -> Result<(), CommandError> {
+        if epoch < self.epoch {
+            return Err(CommandError::StaleEpoch);
+        }
+        self.epoch = epoch;
+        Ok(())
+    }
+
+    /// Ownership was lost (fenced takeover, lease expiry) or a durable
+    /// commit failed: stop producing effects. Queued transmits and events
+    /// are dropped; every input is ignored from now on.
+    pub fn halt(&mut self) {
+        self.jr.halted = true;
+        self.timers.clear();
+        self.transmits.clear();
+        self.events.clear();
+        self.resolves.clear();
+    }
+
+    pub fn is_halted(&self) -> bool {
+        self.jr.halted
+    }
+
+    /// Self-fencing: the engine owns its legs only until `until` (engine
+    /// clock, ms); from then on it halts at its next input, timer or
+    /// transition, without needing to reach the store or the egress. A
+    /// renewal moves it (only forward; `None` removes the lease).
+    ///
+    /// Safety needs the authority to wait out the lease before a new owner
+    /// starts: compute `until` from when the lease was *requested* (not
+    /// granted), and let the authority add a margin for clock-rate drift
+    /// and for the driver's delay between an input and dispatching its
+    /// output (both bounded by the driver, not by the engine).
+    pub fn set_lease(&mut self, until: Option<u64>) {
+        self.lease_until = match (self.lease_until, until) {
+            (Some(old), Some(new)) => Some(old.max(new)),
+            (_, u) => u,
+        };
+    }
+
+    /// The lease's end, if any.
+    pub fn lease(&self) -> Option<u64> {
+        self.lease_until
+    }
+
+    /// Halts the engine once its lease has run out; true when halted.
+    fn lease_lapsed(&mut self, now: u64) -> bool {
+        if !self.jr.halted && self.lease_until.is_some_and(|u| now >= u) {
+            self.stats.lease_lapsed = true;
+            self.halt();
+        }
+        self.jr.halted
+    }
+
+    /// `submit` with a caller key for the operation: the same key with the
+    /// same command again (a retry after an ambiguous outcome) does nothing
+    /// new and reports the recorded outcome; the same key with another
+    /// command is a conflict.
+    pub fn submit_keyed(&mut self, key: &str, cmd: UaCommand, now: u64) -> Result<KeyedAccepted, CommandError> {
+        if key.is_empty() || key.len() > 256 || !is_safe_value(key) {
+            return Err(CommandError::InvalidArgument("operation key".into()));
+        }
+        let fp = fingerprint(&cmd);
+        if let Some(r) = self.ops.get(key) {
+            if r.fingerprint != fp {
+                return Err(CommandError::KeyConflict);
+            }
+            return Ok(KeyedAccepted { op: r.op, leg: r.leg, replayed: true, status: r.status.clone() });
+        }
+        let acc = self.submit(cmd, now)?;
+        if self.ops.len() >= self.cfg.max_op_records {
+            // Forget finished operations first, oldest key order otherwise.
+            let victim = self.ops.iter().find(|(_, r)| !matches!(r.status, OpStatus::Accepted)).map(|(k, _)| k.clone());
+            if let Some(k) = victim.or_else(|| self.ops.keys().next().cloned()) {
+                if let Some(r) = self.ops.remove(&k) {
+                    self.op_keys.remove(&r.op);
+                }
+                self.jr.ops_removed.insert(k);
+            }
+        }
+        let rec = OpRecord { key: key.to_string(), fingerprint: fp, op: acc.op, leg: acc.leg, status: OpStatus::Accepted };
+        self.ops.insert(key.to_string(), rec);
+        self.op_keys.insert(acc.op, key.to_string());
+        self.jr.ops.insert(key.to_string());
+        Ok(KeyedAccepted { op: acc.op, leg: acc.leg, replayed: false, status: OpStatus::Accepted })
+    }
+
+    fn mark_leg(&mut self, id: UaLegId) {
+        if self.cfg.durable {
+            self.jr.legs.insert(id);
+        }
+    }
+
+    fn mark_txn(&mut self, id: TxnId) {
+        if self.cfg.durable {
+            self.jr.txns.insert(id);
+        }
     }
 
     pub fn poll_resolve(&mut self) -> Option<ResolveRequest> {
@@ -692,7 +1012,15 @@ impl UaEngine {
 
     /// The earliest armed timer (may be a cancelled one; firing it is harmless).
     pub fn next_timeout(&self) -> Option<u64> {
-        self.timers.peek().map(|Reverse((at, _, _))| *at)
+        if self.jr.halted {
+            return None;
+        }
+        // Wake at the lease's end too, so the halt is observed promptly.
+        let t = self.timers.peek().map(|Reverse((at, _, _))| *at);
+        match (t, self.lease_until) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     // ------------------------------------------------------------- query --
@@ -711,6 +1039,7 @@ impl UaEngine {
             last_seq: l.seq,
             remote_target: l.remote_target.clone(),
             session_timer: l.ext.st.interval.map(|i| (i, l.ext.st.we_refresh)),
+            peer_recv_info: l.peer_recv_info.clone(),
         })
     }
 
@@ -750,6 +1079,18 @@ impl UaEngine {
 
     fn token(&mut self) -> String {
         format!("{:016x}", self.entropy.next_u64())
+    }
+
+    /// A new Call-ID; a shard draws until it routes to itself (expected
+    /// `count` draws).
+    fn call_id(&mut self) -> String {
+        let Some(sh) = self.cfg.shard.filter(|s| s.count > 1) else { return self.token() };
+        loop {
+            let c = self.token();
+            if crate::shard::shard_of_call_id(&c, sh.count) == sh.index {
+                return c;
+            }
+        }
     }
 
     fn branch(&mut self) -> String {
@@ -811,11 +1152,35 @@ impl UaEngine {
             return;
         }
         leg.seq = leg.seq.saturating_add(1);
-        self.events.push_back(EventEnvelope { leg: leg.id, seq: leg.seq, generation: Generation(leg.generation), op, dialog: leg.dialog_id(), event });
+        self.event_seq = self.event_seq.saturating_add(1);
+        let status = match &event {
+            UaEvent::Accepted(a) => Some((op, OpStatus::Completed { code: a.status.code })),
+            UaEvent::Completed(c) => Some((op, OpStatus::Completed { code: c.status.code })),
+            UaEvent::Failed(f) => Some((op, OpStatus::Failed { cause: f.cause.clone() })),
+            UaEvent::Terminated(t) => {
+                leg.ext.end_cause = Some(Box::new(t.cause.clone()));
+                Some((leg.origin_op, OpStatus::Ended { cause: t.cause.clone() }))
+            }
+            _ => None,
+        };
+        if let Some((Some(o), st)) = status
+            && let Some(k) = self.op_keys.get(&o).cloned()
+            && let Some(r) = self.ops.get_mut(&k)
+        {
+            r.status = st;
+            if self.cfg.durable {
+                self.jr.ops.insert(k);
+            }
+        }
+        let log_seq = self.event_seq;
+        self.events.push_back(EventEnvelope { leg: leg.id, seq: leg.seq, log_seq, generation: Generation(leg.generation), op, dialog: leg.dialog_id(), event });
     }
 
     fn send_raw(&mut self, dest: Dest, data: Arc<[u8]>, txn: Option<TxnId>) {
-        self.transmits.push_back(Transmit { dest, data, txn });
+        if self.jr.halted {
+            return;
+        }
+        self.transmits.push_back(Transmit { dest, data, txn, epoch: self.epoch });
     }
 
     fn new_txn_id(&mut self) -> TxnId {
@@ -828,6 +1193,7 @@ impl UaEngine {
     fn with_leg<R>(&mut self, id: UaLegId, now: u64, f: impl FnOnce(&mut Self, &mut Leg) -> R) -> Option<R> {
         let mut leg = self.legs.remove(&id)?;
         let r = f(self, &mut leg);
+        self.mark_leg(id);
         if leg.overloaded && leg.phase != Phase::Terminated {
             leg.overloaded = false;
             let cause = Cause::new(CauseKind::Overload).with_detail("event queue full");
@@ -843,6 +1209,7 @@ impl UaEngine {
     }
 
     fn cleanup(&mut self, leg: &mut Leg, now: u64) {
+        self.bury(leg);
         // RFC 3261 §15.1.2: every request of the dialog still waiting for a
         // final gets 487 (a non-INVITE server transaction in Trying has no
         // timer of its own and would otherwise never end).
@@ -859,7 +1226,11 @@ impl UaEngine {
             }
         }
         for t in leg.dialog_tags.drain(..) {
-            self.dialogs.remove(&(leg.call_id.clone(), leg.local_tag.clone(), t));
+            let key = (leg.call_id.clone(), leg.local_tag.clone(), t);
+            if let Some(dir) = &self.directory {
+                dir.remove(&key);
+            }
+            self.dialogs.remove(&key);
         }
         if let Some(k) = leg.merged_key.take() {
             self.merged.remove(&k);
@@ -876,7 +1247,30 @@ impl UaEngine {
         self.pending_resolve.retain(|_, p| p.leg != leg.id);
     }
 
+    /// Remember how `leg` ended (bounded).
+    fn bury(&mut self, leg: &Leg) {
+        if self.cfg.max_tombstones == 0 {
+            return;
+        }
+        let local = Cause::new(CauseKind::Local);
+        let cause = leg.ext.end_cause.as_deref().unwrap_or(&local);
+        let evicted = self.tombstones.push(leg.id, (&leg.call_id, &leg.local_tag, leg.remote_tag.as_deref()), cause, leg.seq, self.cfg.max_tombstones);
+        if self.cfg.durable {
+            for old in evicted {
+                self.jr.tombstones.remove(&old);
+                self.jr.tombstones_removed.insert(old);
+            }
+        }
+        if self.cfg.durable {
+            self.jr.tombstones.insert(leg.id);
+        }
+    }
+
     fn remove_txn(&mut self, t: TxnId) {
+        if self.cfg.durable {
+            self.jr.txns.remove(&t);
+            self.jr.txns_removed.insert(t);
+        }
         if let Some(e) = self.txns.remove(&t) {
             match e.key {
                 TxnKey::Client(k) => {
@@ -893,7 +1287,7 @@ impl UaEngine {
         if leg.phase == Phase::Terminated {
             return;
         }
-        leg.phase = Phase::Terminated;
+        leg.set_phase(Phase::Terminated);
         let op = leg.origin_op;
         self.emit(leg, op, UaEvent::Terminated(TerminationEvent { cause }));
     }
@@ -907,12 +1301,39 @@ impl UaEngine {
         if !leg.dialog_tags.iter().any(|t| t == tag) {
             leg.dialog_tags.push(tag.to_string());
         }
-        self.dialogs.insert((leg.call_id.clone(), leg.local_tag.clone(), tag.to_string()), leg.id);
+        let key = (leg.call_id.clone(), leg.local_tag.clone(), tag.to_string());
+        self.publish_dialog(leg, &key);
+        self.dialogs.insert(key, leg.id);
+    }
+
+    /// List a dialog in the shared directory (sharded runtimes).
+    fn publish_dialog(&self, leg: &mut Leg, key: &(String, String, String)) {
+        if let Some(dir) = &self.directory {
+            let status = leg.status.get_or_insert_with(|| std::sync::Arc::new(crate::shard::LegStatus::new(leg.role, leg.phase))).clone();
+            dir.insert(key.clone(), self.cfg.shard.map_or(0, |s| s.index), leg.id, status);
+        }
     }
 
     fn unregister_dialog(&mut self, leg: &mut Leg, tag: &str) {
         leg.dialog_tags.retain(|t| t != tag);
-        self.dialogs.remove(&(leg.call_id.clone(), leg.local_tag.clone(), tag.to_string()));
+        let key = (leg.call_id.clone(), leg.local_tag.clone(), tag.to_string());
+        if let Some(dir) = &self.directory {
+            dir.remove(&key);
+        }
+        self.dialogs.remove(&key);
+    }
+
+    /// Share this engine's dialogs with the other shards of a runtime
+    /// (publishes the ones it already has, e.g. after a restore).
+    pub fn set_dialog_directory(&mut self, dir: std::sync::Arc<crate::shard::DialogDirectory>) {
+        self.directory = Some(dir);
+        let keys: Vec<((String, String, String), UaLegId)> = self.dialogs.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        for (k, id) in keys {
+            if let Some(mut leg) = self.legs.remove(&id) {
+                self.publish_dialog(&mut leg, &k);
+                self.legs.insert(id, leg);
+            }
+        }
     }
 
     // ------------------------------------------------------ transactions --
@@ -934,6 +1355,10 @@ impl UaEngine {
     }
 
     fn txn_do(&mut self, id: TxnId, now: u64, f: impl FnOnce(&mut Txn) -> Vec<TxnOut>) {
+        if self.lease_lapsed(now) {
+            return;
+        }
+        self.mark_txn(id);
         let Some(e) = self.txns.get_mut(&id) else { return };
         let outs = f(&mut e.txn);
         self.run(id, outs, now);
@@ -967,6 +1392,9 @@ impl UaEngine {
             if let Some(l) = leg_id.and_then(|l| self.legs.get_mut(&l)) {
                 l.local_contact = c;
             }
+            if let Some(l) = leg_id {
+                self.mark_leg(l);
+            }
         }
     }
 
@@ -980,6 +1408,10 @@ impl UaEngine {
         let (txn, outs) = Txn::client(id, req, dest, self.cfg.timers, now);
         self.client_keys.insert(key.clone(), id);
         self.txns.insert(id, TxnEntry { txn, purpose, key: TxnKey::Client(key) });
+        self.mark_txn(id);
+        if let Purpose::Invite(l) | Purpose::ReInvite(l, _) | Purpose::Update(l, _) = purpose {
+            self.mark_leg(l);
+        }
         match purpose {
             Purpose::Invite(l) => {
                 if let Some(leg) = self.legs.get_mut(&l) {
@@ -1045,6 +1477,7 @@ impl UaEngine {
         let bytes: Arc<[u8]> = req.to_bytes().into();
         if let Some(l) = self.legs.get_mut(&leg) {
             l.ack = Some((cseq, bytes.clone(), d));
+            self.mark_leg(leg);
         }
         self.send_raw(d, bytes, None);
         Ok(())
@@ -1052,6 +1485,9 @@ impl UaEngine {
 
     /// The driver resolved a [`ResolveRequest`] (first entry is used).
     pub fn resolved(&mut self, id: u64, result: Result<Vec<Dest>, String>, now: u64) {
+        if self.lease_lapsed(now) {
+            return;
+        }
         let Some(p) = self.pending_resolve.remove(&id) else { return };
         let leg_id = p.leg;
         let dest = match result {
@@ -1062,6 +1498,7 @@ impl UaEngine {
                     && let Some(l) = self.legs.get_mut(&leg_id)
                 {
                     l.ext.fo.alternatives = v;
+                    self.mark_leg(leg_id);
                 }
                 Ok(first)
             }
@@ -1100,10 +1537,15 @@ impl UaEngine {
     /// A reliable flow closed: drop the affinity so later requests use the
     /// route set / remote target again.
     pub fn handle_flow_closed(&mut self, conn: &Dest) {
+        let mut changed = Vec::new();
         for l in self.legs.values_mut() {
             if l.flow.as_ref() == Some(conn) {
                 l.flow = None;
+                changed.push(l.id);
             }
+        }
+        for id in changed {
+            self.mark_leg(id);
         }
     }
 
@@ -1132,6 +1574,9 @@ impl UaEngine {
 
     /// Run every timer due at `now`.
     pub fn handle_timeout(&mut self, now: u64) {
+        if self.lease_lapsed(now) {
+            return;
+        }
         while let Some(Reverse((at, _, r))) = self.timers.peek().copied() {
             if at > now {
                 break;
@@ -1217,6 +1662,9 @@ impl UaEngine {
 
     /// One received SIP message (datagram or framed stream message).
     pub fn handle_message(&mut self, data: &[u8], src: Dest, now: u64) {
+        if self.lease_lapsed(now) {
+            return;
+        }
         let msg = match SipMessage::parse(data, &self.cfg.limits) {
             Ok(m) => m,
             Err(_) => {
@@ -1294,6 +1742,7 @@ impl UaEngine {
         let txn = Txn::server(tid, req.clone(), dest, self.cfg.timers, now);
         self.server_keys.insert(key.clone(), tid);
         self.txns.insert(tid, TxnEntry { txn, purpose: Purpose::Detached, key: TxnKey::Server(key.clone()) });
+        self.mark_txn(tid);
         if method == Method::Cancel {
             self.on_cancel(tid, &req, key, now);
             return;
@@ -1428,6 +1877,8 @@ impl UaEngine {
         let to = req.header("To").unwrap_or_default().to_string();
         let local_contact = self.contact_for(src.proto, secure).unwrap_or_default();
         let mut leg = Leg {
+            status: None,
+            peer_recv_info: None,
             id,
             role: Role::Uas,
             phase: Phase::Calling,
@@ -1477,9 +1928,11 @@ impl UaEngine {
             dialog_tags: Vec::new(),
             ext: LegExt::default(),
         };
+        Self::note_recv_info(&mut leg, &req);
         if let Some(e) = self.txns.get_mut(&tid) {
             e.purpose = Purpose::Invite(id);
         }
+        self.mark_txn(tid);
         self.merged.insert(mkey, id);
         // The Min-SE check above already answered 422 where needed.
         let _ = self.st_on_request(&mut leg, &req);
@@ -1513,6 +1966,7 @@ impl UaEngine {
         };
         self.emit(&mut leg, None, UaEvent::IncomingInvite(ev));
         self.legs.insert(id, leg);
+        self.mark_leg(id);
         // Apply the overload policy if the event could not be queued.
         self.with_leg(id, now, |_, _| ());
     }
@@ -1528,6 +1982,9 @@ impl UaEngine {
         }
         if code >= 200 {
             r.push_header("Allow", ALLOW);
+        }
+        if code >= 180 && matches!(req.method(), Some(Method::Invite | Method::Update)) {
+            self.push_recv_info(&mut r);
         }
         for h in headers {
             r.push_header(h.name.as_str(), h.value.as_str());
@@ -1621,8 +2078,18 @@ impl UaEngine {
             Method::Invite => self.on_reinvite(leg, tid, req, now),
             Method::Update => self.on_update(leg, tid, req, now),
             Method::Info => {
+                let package = req.header("Info-Package").map(|p| p.split(';').next().unwrap_or("").trim().to_string());
+                if let Some(p) = &package
+                    && !self.cfg.recv_info.as_ref().is_some_and(|l| l.iter().any(|x| x.eq_ignore_ascii_case(p)))
+                {
+                    // RFC 6086 §5.2.6: not a package we said we accept.
+                    let ours = self.cfg.recv_info.as_ref().map(|l| l.join(", ")).unwrap_or_default();
+                    self.reply_simple(tid, 469, None, &[("Recv-Info", ours)], now);
+                    return;
+                }
                 self.reply_simple(tid, 200, None, &[], now);
                 let ev = InfoEvent {
+                    package,
                     content_type: req.content_type().map(str::to_string),
                     body: req.body.clone(),
                     headers: req.headers.clone(),
@@ -1679,9 +2146,11 @@ impl UaEngine {
     }
 
     fn on_reinvite(&mut self, leg: &mut Leg, tid: TxnId, req: SipMessage, now: u64) {
+        Self::note_recv_info(leg, &req);
         if let Some(e) = self.txns.get_mut(&tid) {
             e.purpose = Purpose::ReInvite(leg.id, None);
         }
+        self.mark_txn(tid);
         if !self.offer_allowed(leg, tid, now) {
             return;
         }
@@ -1708,9 +2177,11 @@ impl UaEngine {
     }
 
     fn on_update(&mut self, leg: &mut Leg, tid: TxnId, req: SipMessage, now: u64) {
+        Self::note_recv_info(leg, &req);
         if let Some(e) = self.txns.get_mut(&tid) {
             e.purpose = Purpose::Update(leg.id, None);
         }
+        self.mark_txn(tid);
         if req.body.is_empty() {
             // Target / session refresh only (RFC 3311 §5.2, RFC 4028).
             if let Err(min) = self.st_on_request(leg, &req) {
@@ -1844,19 +2315,34 @@ impl UaEngine {
     fn on_txn_response(&mut self, tid: TxnId, purpose: Purpose, resp: SipMessage, now: u64) {
         match purpose {
             Purpose::Invite(leg) => {
-                let found = self.with_leg(leg, now, |s, l| s.uac_invite_response(l, tid, &resp, now));
+                let found = self.with_leg(leg, now, |s, l| {
+                    if resp.status().is_some_and(|c| (180..300).contains(&c)) {
+                        Self::note_recv_info(l, &resp);
+                    }
+                    s.uac_invite_response(l, tid, &resp, now);
+                });
                 if found.is_none() {
                     self.ack_orphan_2xx(tid, &resp);
                 }
             }
             Purpose::ReInvite(leg, Some(op)) => {
-                let found = self.with_leg(leg, now, |s, l| s.reinvite_response(l, tid, op, &resp, now));
+                let found = self.with_leg(leg, now, |s, l| {
+                    if resp.status().is_some_and(|c| (200..300).contains(&c)) {
+                        Self::note_recv_info(l, &resp);
+                    }
+                    s.reinvite_response(l, tid, op, &resp, now);
+                });
                 if found.is_none() {
                     self.ack_orphan_2xx(tid, &resp);
                 }
             }
             Purpose::Update(leg, Some(op)) => {
-                self.with_leg(leg, now, |s, l| s.update_response(l, tid, op, &resp, now));
+                self.with_leg(leg, now, |s, l| {
+                    if resp.status().is_some_and(|c| (200..300).contains(&c)) {
+                        Self::note_recv_info(l, &resp);
+                    }
+                    s.update_response(l, tid, op, &resp, now);
+                });
             }
             Purpose::Bye(leg) => {
                 if resp.status().is_some_and(|c| c >= 200) {
@@ -2028,7 +2514,7 @@ impl UaEngine {
                         let deadline = now.saturating_add(self.cfg.answer_timeout_ms);
                         self.arm_leg(leg, LegTimer::AnswerDeadline, deadline);
                         if leg.phase == Phase::Calling {
-                            leg.phase = Phase::Early;
+                            leg.set_phase(Phase::Early);
                         }
                         let op = leg.origin_op;
                         self.emit(leg, op, UaEvent::Provisional(ProvisionalEvent { status, remote_tag: tag, sdp: Some(o.to_vec()) }));
@@ -2042,7 +2528,7 @@ impl UaEngine {
                     self.send_prack(leg, t, n, invite_cseq, None, now);
                 }
                 if leg.phase == Phase::Calling {
-                    leg.phase = Phase::Early;
+                    leg.set_phase(Phase::Early);
                 }
             }
             if leg.cancel == CancelState::Requested {
@@ -2130,7 +2616,7 @@ impl UaEngine {
             }
         }
         self.register_dialog(leg, &tag);
-        leg.phase = Phase::Confirmed;
+        leg.set_phase(Phase::Confirmed);
         leg.disarm(LegTimer::NoAnswer);
         // Only needed to resend the INVITE with credentials.
         leg.invite_template = None;
@@ -2195,7 +2681,7 @@ impl UaEngine {
         for t in std::mem::take(&mut leg.early) {
             self.unregister_dialog(leg, &t.tag);
         }
-        leg.phase = Phase::Calling;
+        leg.set_phase(Phase::Calling);
         let dest = leg.invite_dest.or_else(|| self.txns.get(&tid).map(|e| e.txn.dest));
         let Some(dest) = dest else { return false };
         // The leg is out of the map: register the txn on it directly.
@@ -2204,6 +2690,7 @@ impl UaEngine {
                 if let Some(e) = self.txns.get_mut(&id) {
                     e.purpose = Purpose::Invite(leg.id);
                 }
+                self.mark_txn(id);
                 leg.invite_txn = Some(id);
                 true
             }
@@ -2232,7 +2719,25 @@ impl UaEngine {
         if let Some(ua) = &self.cfg.user_agent {
             m.push_header("User-Agent", ua.as_str());
         }
+        if matches!(method, Method::Invite | Method::Update) {
+            self.push_recv_info(&mut m);
+        }
         m
+    }
+
+    /// RFC 6086 §5.2.2: our `Recv-Info` (possibly empty) on INVITE/UPDATE
+    /// and their 18x/2xx, when the framework is in use.
+    fn push_recv_info(&self, m: &mut SipMessage) {
+        if let Some(p) = &self.cfg.recv_info {
+            m.push_header("Recv-Info", p.join(", "));
+        }
+    }
+
+    /// Remember the peer's `Recv-Info` (an empty one: no packages).
+    fn note_recv_info(leg: &mut Leg, m: &SipMessage) {
+        if m.header("Recv-Info").is_some() {
+            leg.peer_recv_info = Some(m.values("Recv-Info").into_iter().filter(|v| !v.is_empty()).collect());
+        }
     }
 
     fn next_cseq(leg: &mut Leg) -> Option<u32> {
@@ -2277,7 +2782,7 @@ impl UaEngine {
         if let Some(r) = reason {
             bye.push_header("Reason", r);
         }
-        leg.phase = Phase::Terminating;
+        leg.set_phase(Phase::Terminating);
         leg.disarm(LegTimer::Retransmit2xx);
         leg.disarm(LegTimer::AckTimeout);
         leg.disarm(LegTimer::AnswerDeadline);
@@ -2561,6 +3066,9 @@ impl UaEngine {
 
     /// `submit` with a caller-allocated operation id.
     pub fn submit_with(&mut self, op: OperationId, cmd: UaCommand, now: u64) -> Result<Accepted, CommandError> {
+        if self.lease_lapsed(now) {
+            return Err(CommandError::Halted);
+        }
         if let UaCommand::Originate(o) = cmd {
             return self.originate(op, *o, now);
         }
@@ -2611,11 +3119,20 @@ impl UaEngine {
                 if !is_safe_value(&r.content_type) {
                     return Err(CommandError::InvalidArgument("content type".into()));
                 }
+                // RFC 6086 §5.2.5: only a package the peer listed.
+                if let Some(p) = &r.package
+                    && (!is_safe_value(p) || !leg.peer_recv_info.as_ref().is_some_and(|l| l.iter().any(|x| x.eq_ignore_ascii_case(p))))
+                {
+                    return Err(CommandError::InvalidArgument(format!("the peer did not list Info Package {p}")));
+                }
                 check_headers(&r.headers)?;
                 let cseq = Self::next_cseq(leg).ok_or(CommandError::InvalidState("CSeq space exhausted"))?;
                 let mut m = self.dialog_request(leg, Method::Info, cseq);
                 for h in r.headers {
                     m.push_header(h.name, h.value);
+                }
+                if let Some(p) = r.package {
+                    m.push_header("Info-Package", p);
                 }
                 m.push_header("Content-Type", r.content_type);
                 m.body = r.body;
@@ -2630,7 +3147,7 @@ impl UaEngine {
                     return Err(CommandError::InvalidArgument("DTMF digit".into()));
                 }
                 let body = crate::dtmf::relay_body(&r.dtmf);
-                let info = InfoRequest { leg: r.leg, content_type: "application/dtmf-relay".into(), body, headers: Vec::new() };
+                let info = InfoRequest { leg: r.leg, content_type: "application/dtmf-relay".into(), body, headers: Vec::new(), package: None };
                 self.leg_command(leg, op, UaCommand::SendInfo(info), now)
             }
             UaCommand::RespondToOffer(r) => {
@@ -2741,7 +3258,7 @@ impl UaEngine {
             leg.generation = leg.generation.saturating_add(1);
         }
         leg.oa = next_oa;
-        leg.phase = Phase::Confirmed;
+        leg.set_phase(Phase::Confirmed);
         leg.initial_ack_pending = true;
         leg.disarm(LegTimer::UasAnswer);
         let cseq = req.cseq().map_or(0, |c| c.0);
@@ -2832,11 +3349,13 @@ impl UaEngine {
         if self.legs.contains_key(&id) {
             return Err(CommandError::InvalidArgument("leg id in use".into()));
         }
-        let call_id = self.token();
+        let call_id = self.call_id();
         let local_tag = self.token();
         let secure = parse_uri(o.request_uri.as_bytes()).is_some_and(|u| u.is_sips());
         let route_set: Vec<String> = o.route_set.iter().map(|r| angle(r)).collect();
         let mut leg = Leg {
+            status: None,
+            peer_recv_info: None,
             id,
             role: Role::Uac,
             phase: Phase::Calling,
@@ -2922,6 +3441,7 @@ impl UaEngine {
         match res {
             Ok(()) => {
                 self.legs.insert(id, leg);
+                self.mark_leg(id);
                 Ok(Accepted { op, leg: id })
             }
             Err(e) => {
@@ -2930,6 +3450,22 @@ impl UaEngine {
             }
         }
     }
+}
+
+/// A stable hash (FNV-1a 64) of a command's semantic parameters, for
+/// `submit_keyed`: the leg id an Originate may carry and credentials'
+/// passwords don't count.
+fn fingerprint(cmd: &UaCommand) -> u64 {
+    let canon = match cmd {
+        UaCommand::Originate(o) => {
+            let mut o = (**o).clone();
+            o.leg = None;
+            let user = o.credentials.take().map(|c| (c.username, c.realm));
+            format!("originate|{o:?}|{user:?}")
+        }
+        other => format!("{other:?}"),
+    };
+    canon.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
 }
 
 /// Request-URI and Route headers for a request with this target and route

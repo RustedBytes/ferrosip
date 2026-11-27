@@ -1777,9 +1777,11 @@ dependencies = [
  "mod-location",
  "mod-media",
  "ring",
+ "serde",
  "sip-core",
  "sip-parser",
  "sip-transport",
+ "socket2",
 ]
 
 [[package]]

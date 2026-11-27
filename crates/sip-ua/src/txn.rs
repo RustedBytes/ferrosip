@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 /// RFC 3261 timer values, milliseconds.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct TimerConfig {
     pub t1: u64,
     pub t2: u64,
@@ -38,6 +39,7 @@ impl TimerConfig {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub enum TimerKind {
     /// INVITE client retransmit.
     A,
@@ -66,6 +68,7 @@ pub enum TimerKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub enum Kind {
     InviteClient,
     NonInviteClient,
@@ -74,6 +77,7 @@ pub enum Kind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub enum State {
     Calling,
     Trying,
@@ -102,15 +106,23 @@ pub enum TxnOut {
     Terminated,
 }
 
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct Txn {
     pub id: TxnId,
     pub kind: Kind,
     pub state: State,
     /// Requests go here (client); responses go here (server).
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::dest_serde"))]
     pub dest: Dest,
+    /// Stored in its wire form; a client transaction's `request_bytes` are
+    /// that same serialization and are rebuilt on load ([`Txn::restored`]).
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::msg_wire"))]
     pub request: SipMessage,
+    #[cfg_attr(feature = "recovery", serde(skip))]
     request_bytes: Arc<[u8]>,
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::bytes_serde::opt_arc"))]
     last_response: Option<Arc<[u8]>>,
+    #[cfg_attr(feature = "recovery", serde(with = "crate::recovery::bytes_serde::opt_arc"))]
     ack: Option<Arc<[u8]>>,
     interval: u64,
     /// Armed timers and their deadlines (stale heap entries are ignored).
@@ -120,6 +132,15 @@ pub struct Txn {
 }
 
 impl Txn {
+    /// After loading from a record: the bytes a client transaction
+    /// retransmits are its request's serialization (as when it was made).
+    #[cfg(feature = "recovery")]
+    pub(crate) fn restored(&mut self) {
+        if matches!(self.kind, Kind::InviteClient | Kind::NonInviteClient) {
+            self.request_bytes = self.request.to_bytes().into();
+        }
+    }
+
     fn reliable(&self) -> bool {
         self.dest.proto.is_stream()
     }
@@ -199,6 +220,11 @@ impl Txn {
             cfg,
             created: now,
         }
+    }
+
+    /// Armed timers (absolute engine time), for rebuilding the timer heap.
+    pub fn armed_timers(&self) -> Vec<(TimerKind, u64)> {
+        self.armed.clone()
     }
 
     /// The last response this server transaction sent.

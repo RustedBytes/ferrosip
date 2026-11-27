@@ -13,6 +13,7 @@ use crate::msg::StartLine;
 use sip_parser::uri::parse_contact;
 
 #[derive(Debug, Default)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub(super) struct Redirects {
     /// Request-URIs this call has tried (lower-cased).
     visited: Vec<String>,
@@ -69,7 +70,7 @@ impl UaEngine {
         for t in std::mem::take(&mut leg.early) {
             self.unregister_dialog(leg, &t.tag);
         }
-        leg.phase = Phase::Calling;
+        leg.set_phase(Phase::Calling);
         leg.invite_txn = None;
         leg.invite_dest = None;
         let id = leg.id;

@@ -145,6 +145,32 @@ reliable 1xx without an offer, 2xx / reliable 1xx / request
 retransmissions, session refreshes and their expiry BYE, RFC 3263
 failover, 422 retries, 481/487/491/500 answers.
 
+## Sharding
+
+`RuntimeConfig { shards: n, .. }` runs `n` engines (threads) behind the
+same listeners: messages are routed by Call-ID, commands by leg id
+(striped per shard), `Replaces` works across shards through a shared
+dialog directory, events arrive on one channel. See
+[`docs/sip-ua.md`](../../docs/sip-ua.md#sharding) and `examples/bench_shards`.
+
+## Recovery (feature `recovery`)
+
+Durable mode makes every input's effects leave the engine as a
+`Transition` (state delta + transmits + events) that the driver commits
+before dispatching; `UaEngine::restore` rebuilds an engine from the
+folded journal (`StateRecord`), with deadlines rebased for downtime,
+indexes and timers rebuilt and a per-leg report. `submit_keyed` makes
+mutating commands idempotent across retries and restarts; `leg_outcome`
+and `op_outcome` answer after events were missed; an owner epoch on
+every transmit and transition lets a newer owner fence an older one
+(store fence, admission check for stateless replies, `EgressFence` in
+the runtime driver).
+`MemoryJournal` (tests, failpoints) and `FileJournal` (fsync per
+transition, atomic checkpoints) are included; `examples/recoverable_ua`
+is a durable UA process, `examples/bench_durable` measures the cost, and `interop/sip-ua-rtpflux` (a separate
+workspace) a durable media B2BUA on rtpflux's native API. Design, invariants, clock and transport policy,
+supported scope: [`docs/sip-ua-recovery.md`](../../docs/sip-ua-recovery.md).
+
 ## Routing adapters
 
 `routing` turns where-to-call decisions into `OriginateRequest` fields:

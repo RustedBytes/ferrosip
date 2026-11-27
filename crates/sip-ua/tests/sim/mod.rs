@@ -23,6 +23,47 @@ pub struct Node {
     pub addr: SocketAddr,
     pub engine: UaEngine,
     pub events: Vec<EventEnvelope>,
+    pub cfg: UaConfig,
+    /// Durable mode: the node's journal (feature `recovery`).
+    #[cfg(feature = "recovery")]
+    pub journal: Option<sip_ua::recovery::MemoryJournal>,
+    /// Crash at this boundary on the next committed transition.
+    #[cfg(feature = "recovery")]
+    pub crash_at: Option<Boundary>,
+    /// Restores done (each picks a new entropy seed).
+    pub restarts: u64,
+    /// A stale incarnation of this node (an old owner still running after
+    /// a takeover: paused process, partition). It shares the node's
+    /// address and journal.
+    #[cfg(feature = "recovery")]
+    pub stale: Option<Stale>,
+}
+
+/// An old owner that has not noticed it lost ownership.
+#[cfg(feature = "recovery")]
+pub struct Stale {
+    pub engine: UaEngine,
+    /// It gets a copy of every packet sent to the node's address (an
+    /// address both can be reached at during a failover).
+    pub hears: bool,
+    /// It can reach the store (false: partitioned from it; every append
+    /// and admission check fails).
+    pub reaches_store: bool,
+    /// Its timers run.
+    pub running: bool,
+    pub events: Vec<EventEnvelope>,
+}
+
+/// Where a durable node dies in its commit-then-dispatch cycle.
+#[cfg(feature = "recovery")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Boundary {
+    /// The transition was computed but never persisted.
+    PreCommit,
+    /// Persisted, nothing dispatched.
+    PostCommit,
+    /// Persisted and dispatched, but the dispatch was not recorded.
+    PostSend,
 }
 
 /// A datagram on the wire.
@@ -31,6 +72,10 @@ pub struct Packet {
     pub from: SocketAddr,
     pub to: SocketAddr,
     pub data: Vec<u8>,
+    /// Owner epoch of the engine that sent it.
+    pub epoch: u64,
+    /// Simulated time it was sent.
+    pub at: u64,
 }
 
 impl Packet {
@@ -58,8 +103,15 @@ pub struct Net {
     pub log: Vec<Packet>,
     pub rule: Rule,
     pub resolver: Resolve,
+    /// Wall clock = engine clock + this (restores jump it forward).
+    pub wall_offset: u64,
     /// Extra random delay per packet (reordering): (rng, max ms).
     pub jitter: Option<(SeededEntropy, u64)>,
+    /// The egress point of one node's address: drops its transmits of
+    /// fenced epochs.
+    pub egress: Option<(SocketAddr, EgressFence)>,
+    /// Transmits the egress fence dropped.
+    pub egress_dropped: Vec<Packet>,
 }
 
 pub fn addr(s: &str) -> SocketAddr {
@@ -84,7 +136,10 @@ impl Net {
             log: Vec::new(),
             rule: Box::new(|_| 1),
             resolver: Box::new(|r| Err(format!("no DNS in tests: {}", r.host))),
+            wall_offset: 1_800_000_000_000,
             jitter: None,
+            egress: None,
+            egress_dropped: Vec::new(),
         }
     }
 
@@ -94,9 +149,208 @@ impl Net {
 
     pub fn add_with(&mut self, a: &str, seed: u64, f: impl FnOnce(UaConfig) -> UaConfig) -> usize {
         let a = addr(a);
-        let engine = UaEngine::with_entropy(f(config(a)), Box::new(SeededEntropy::new(seed)), IdAllocator::new());
-        self.nodes.push(Node { addr: a, engine, events: Vec::new() });
+        let cfg = f(config(a));
+        let engine = UaEngine::with_entropy(cfg.clone(), Box::new(SeededEntropy::new(seed)), IdAllocator::new());
+        self.nodes.push(Node {
+            addr: a,
+            engine,
+            events: Vec::new(),
+            cfg,
+            #[cfg(feature = "recovery")]
+            journal: None,
+            #[cfg(feature = "recovery")]
+            crash_at: None,
+            restarts: 0,
+            #[cfg(feature = "recovery")]
+            stale: None,
+        });
         self.nodes.len() - 1
+    }
+
+    /// A node in durable mode, journaling into memory.
+    #[cfg(feature = "recovery")]
+    pub fn add_durable(&mut self, a: &str, seed: u64, f: impl FnOnce(UaConfig) -> UaConfig) -> usize {
+        let n = self.add_with(a, seed, |c| f(UaConfig { durable: true, ..c }));
+        self.nodes[n].journal = Some(sip_ua::recovery::MemoryJournal::new(10_000));
+        n
+    }
+
+    /// The simulated wall clock (Unix ms): the engine clock plus `wall_offset`.
+    pub fn wall(&self) -> u64 {
+        self.now + self.wall_offset
+    }
+
+    /// Kill node `n` and restart it from its journal after `downtime_ms`
+    /// (the wall clock moves on; the engine clock is the simulation's).
+    /// Replayed effects are dispatched as a restarting driver would.
+    /// Packets in flight to it are lost.
+    #[cfg(feature = "recovery")]
+    pub fn crash_and_restore(&mut self, n: usize, downtime_ms: u64) -> sip_ua::recovery::RestoreReport {
+        use sip_ua::recovery::RestoreOptions;
+        self.wall_offset += downtime_ms;
+        let to = self.nodes[n].addr;
+        self.inflight.retain(|(_, p)| p.to != to);
+        let state = self.nodes[n].journal.as_ref().expect("durable node").state().expect("state");
+        let restarts = self.nodes[n].restarts + 1;
+        let (engine, report) = UaEngine::restore(
+            self.nodes[n].cfg.clone(),
+            Box::new(SeededEntropy::new(0xdead_0000 + restarts * 7919)),
+            IdAllocator::new(),
+            &state,
+            &RestoreOptions { epoch: self.nodes[n].engine.epoch(), ..RestoreOptions::default() },
+            self.now,
+            self.wall(),
+        )
+        .expect("restore");
+        self.nodes[n].engine = engine;
+        self.nodes[n].restarts = restarts;
+        let from = self.nodes[n].addr;
+        for t in report.replay_transmits.clone() {
+            let p = Packet { from, to: t.dest.addr, data: t.data.to_vec(), epoch: t.epoch, at: self.now };
+            self.put_on_wire(p);
+        }
+        self.nodes[n].events.extend(report.replay_events.clone());
+        if let Some(j) = self.nodes[n].journal.as_mut() {
+            j.dispatched(report.replay_up_to);
+        }
+        self.flush();
+        report
+    }
+
+    pub fn put_on_wire(&mut self, p: Packet) {
+        if self.egress.as_ref().is_some_and(|(a, f)| *a == p.from && !f.admits(p.epoch)) {
+            self.egress_dropped.push(p);
+            return;
+        }
+        let copies = (self.rule)(&p);
+        self.log.push(p.clone());
+        for _ in 0..copies {
+            if self.nodes.iter().any(|n| n.addr == p.to) {
+                let extra = self.jitter.as_mut().map_or(0, |(r, max)| r.next_u64() % (*max + 1));
+                self.inflight.push_back((self.now + LATENCY + extra, p.clone()));
+            } else {
+                self.captured.push(p.clone());
+            }
+        }
+    }
+
+    /// One durable node's transitions: commit, then dispatch (with the
+    /// failpoint applied). Returns whether anything moved.
+    #[cfg(feature = "recovery")]
+    fn flush_durable(&mut self, i: usize) -> bool {
+        let mut moved = false;
+        let (now, wall) = (self.now, self.wall());
+        while let Some(t) = self.nodes[i].engine.take_transition(now, wall) {
+            moved = true;
+            let from = self.nodes[i].addr;
+            if t.needs_commit {
+                if self.nodes[i].crash_at == Some(Boundary::PreCommit) {
+                    self.nodes[i].crash_at = None;
+                    self.crash_and_restore(i, 0);
+                    return true;
+                }
+                let r = self.nodes[i].journal.as_mut().expect("durable").append(&t.record);
+                if r.is_err() {
+                    // Fail closed: no effects past a commit that failed.
+                    self.nodes[i].engine.halt();
+                    return true;
+                }
+                if self.nodes[i].crash_at == Some(Boundary::PostCommit) {
+                    self.nodes[i].crash_at = None;
+                    self.crash_and_restore(i, 0);
+                    return true;
+                }
+            }
+            if !t.needs_commit && self.nodes[i].journal.as_ref().expect("durable").admit(t.record.epoch).is_err() {
+                // Even a stateless reply waits for the ownership check.
+                self.nodes[i].engine.halt();
+                return true;
+            }
+            for tx in &t.record.transmits {
+                let p = Packet { from, to: tx.dest.addr, data: tx.data.to_vec(), epoch: tx.epoch, at: self.now };
+                self.put_on_wire(p);
+            }
+            self.nodes[i].events.extend(t.record.events.iter().cloned());
+            if t.needs_commit {
+                if self.nodes[i].crash_at == Some(Boundary::PostSend) {
+                    self.nodes[i].crash_at = None;
+                    self.crash_and_restore(i, 0);
+                    return true;
+                }
+                if let Some(j) = self.nodes[i].journal.as_mut() {
+                    j.dispatched(t.record.seq);
+                }
+            }
+        }
+        moved
+    }
+
+    /// The stale incarnation's transitions: it tries the store exactly as
+    /// a live owner would; a refused (fenced) or unreachable store halts it.
+    #[cfg(feature = "recovery")]
+    fn flush_stale(&mut self, i: usize) -> bool {
+        let (now, wall) = (self.now, self.wall());
+        let mut moved = false;
+        loop {
+            let node = &mut self.nodes[i];
+            let Some(st) = node.stale.as_mut() else { return moved };
+            let Some(t) = st.engine.take_transition(now, wall) else { return moved };
+            moved = true;
+            let journal = node.journal.as_mut().expect("durable");
+            let ok = st.reaches_store && if t.needs_commit { journal.append(&t.record).is_ok() } else { journal.admit(t.record.epoch).is_ok() };
+            if !ok {
+                st.engine.halt();
+                continue;
+            }
+            st.events.extend(t.record.events.iter().cloned());
+            let from = node.addr;
+            for tx in &t.record.transmits {
+                let p = Packet { from, to: tx.dest.addr, data: tx.data.to_vec(), epoch: tx.epoch, at: now };
+                self.put_on_wire(p);
+            }
+            if t.needs_commit {
+                self.nodes[i].journal.as_mut().expect("durable").dispatched(t.record.seq);
+            }
+        }
+    }
+
+    /// A takeover of node `n` by a new owner of `epoch`: restore from the
+    /// journal (refusing a non-newer epoch), fence the store and the
+    /// egress, and keep the old engine running as the stale incarnation.
+    /// Replayed effects are dispatched by the new owner.
+    #[cfg(feature = "recovery")]
+    pub fn take_over(&mut self, n: usize, epoch: u64, hears: bool, reaches_store: bool) -> sip_ua::recovery::RestoreReport {
+        use sip_ua::recovery::RestoreOptions;
+        let state = self.nodes[n].journal.as_ref().expect("durable node").state().expect("state");
+        let restarts = self.nodes[n].restarts + 1;
+        let (engine, report) = UaEngine::restore(
+            self.nodes[n].cfg.clone(),
+            Box::new(SeededEntropy::new(0xbeef_0000 + restarts * 7919)),
+            IdAllocator::new(),
+            &state,
+            &RestoreOptions { epoch, require_newer_epoch: true, credentials: None },
+            self.now,
+            self.wall(),
+        )
+        .expect("takeover");
+        self.nodes[n].journal.as_mut().expect("durable").fence(epoch);
+        if let Some((_, f)) = self.egress.as_ref().filter(|(a, _)| *a == self.nodes[n].addr) {
+            f.raise(epoch);
+        }
+        let old = std::mem::replace(&mut self.nodes[n].engine, engine);
+        self.nodes[n].stale = Some(Stale { engine: old, hears, reaches_store, running: true, events: Vec::new() });
+        self.nodes[n].restarts = restarts;
+        let from = self.nodes[n].addr;
+        for t in report.replay_transmits.clone() {
+            let p = Packet { from, to: t.dest.addr, data: t.data.to_vec(), epoch: t.epoch, at: self.now };
+            self.put_on_wire(p);
+        }
+        self.nodes[n].events.extend(report.replay_events.clone());
+        if let Some(j) = self.nodes[n].journal.as_mut() {
+            j.dispatched(report.replay_up_to);
+        }
+        self.flush();
+        report
     }
 
     pub fn engine(&mut self, n: usize) -> &mut UaEngine {
@@ -122,10 +376,22 @@ impl Net {
         loop {
             let mut moved = false;
             for i in 0..self.nodes.len() {
+                #[cfg(feature = "recovery")]
+                if self.nodes[i].journal.is_some() && self.flush_durable(i) {
+                    moved = true;
+                }
+                #[cfg(feature = "recovery")]
+                if self.flush_stale(i) {
+                    moved = true;
+                }
                 let from = self.nodes[i].addr;
                 while let Some(t) = self.nodes[i].engine.poll_transmit() {
                     moved = true;
-                    let p = Packet { from, to: t.dest.addr, data: t.data.to_vec() };
+                    let p = Packet { from, to: t.dest.addr, data: t.data.to_vec(), epoch: t.epoch, at: self.now };
+                    if self.egress.as_ref().is_some_and(|(a, f)| *a == p.from && !f.admits(p.epoch)) {
+                        self.egress_dropped.push(p);
+                        continue;
+                    }
                     let copies = (self.rule)(&p);
                     self.log.push(p.clone());
                     for _ in 0..copies {
@@ -164,6 +430,11 @@ impl Net {
         self.flush();
         let next_pkt = self.inflight.iter().map(|(t, _)| *t).min();
         let next_timer = self.nodes.iter().filter_map(|n| n.engine.next_timeout()).min();
+        #[cfg(feature = "recovery")]
+        let next_timer = next_timer
+            .into_iter()
+            .chain(self.nodes.iter().filter_map(|n| n.stale.as_ref().filter(|st| st.running).and_then(|st| st.engine.next_timeout())))
+            .min();
         let Some(next) = [next_pkt, next_timer].into_iter().flatten().min() else { return false };
         if next > cap {
             self.now = self.now.max(cap);
@@ -185,11 +456,19 @@ impl Net {
         for (_, p) in due {
             if let Some(n) = self.nodes.iter_mut().find(|n| n.addr == p.to) {
                 n.engine.handle_message(&p.data, Dest::new(Proto::Udp, p.from), now);
+                #[cfg(feature = "recovery")]
+                if let Some(st) = n.stale.as_mut().filter(|st| st.hears) {
+                    st.engine.handle_message(&p.data, Dest::new(Proto::Udp, p.from), now);
+                }
             }
             self.flush();
         }
         for n in &mut self.nodes {
             n.engine.handle_timeout(now);
+            #[cfg(feature = "recovery")]
+            if let Some(st) = n.stale.as_mut().filter(|st| st.running) {
+                st.engine.handle_timeout(now);
+            }
         }
         self.flush();
         true

@@ -4,6 +4,7 @@
 
 /// One key press.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct Dtmf {
     /// `0`–`9`, `*`, `#`, `A`–`D`.
     pub digit: char,

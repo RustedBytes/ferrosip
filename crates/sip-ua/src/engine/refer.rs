@@ -13,6 +13,7 @@ use super::*;
 use crate::refer::{Replaces, split_refer_to};
 
 #[derive(Debug, Default)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub(super) struct ReferState {
     /// Our REFER before its final response: (transaction, operation).
     client_pending: Option<(TxnId, OperationId)>,
@@ -229,9 +230,20 @@ impl UaEngine {
     pub(super) fn match_replaces(&self, req: &SipMessage) -> Result<Option<UaLegId>, u16> {
         let Some(v) = req.header("Replaces") else { return Ok(None) };
         let r = Replaces::parse(v).ok_or(400u16)?;
-        let id = *self.dialogs.get(&(r.call_id.clone(), r.to_tag.clone(), r.from_tag.clone())).ok_or(481u16)?;
-        let leg = self.legs.get(&id).ok_or(481u16)?;
-        match (leg.role, leg.phase) {
+        let key = (r.call_id.clone(), r.to_tag.clone(), r.from_tag.clone());
+        let (id, role, phase) = match self.dialogs.get(&key) {
+            Some(id) => {
+                let leg = self.legs.get(id).ok_or(481u16)?;
+                (*id, leg.role, leg.phase)
+            }
+            // Sharded: the replaced dialog may be another shard's.
+            None => {
+                let (_, id, status) = self.directory.as_ref().and_then(|d| d.get(&key)).ok_or(481u16)?;
+                let (role, phase) = status.get();
+                (id, role, phase)
+            }
+        };
+        match (role, phase) {
             (_, Phase::Terminating | Phase::Terminated) => Err(481),
             (Role::Uac, Phase::Calling | Phase::Early) => Err(481),
             (_, Phase::Confirmed) if r.early_only => Err(486),

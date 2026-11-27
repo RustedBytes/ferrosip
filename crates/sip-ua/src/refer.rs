@@ -6,6 +6,7 @@ use crate::msg::uri_of;
 /// A `Replaces` header: the dialog to replace, **from the point of view of
 /// the UA that receives the INVITE** (its local tag is `to_tag`).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "recovery", derive(serde::Serialize, serde::Deserialize))]
 pub struct Replaces {
     pub call_id: String,
     pub to_tag: String,

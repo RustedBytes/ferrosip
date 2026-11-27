@@ -18,11 +18,14 @@ md-5 = "0.11"
 sip-transport = { workspace = true, optional = true }
 # ferrosip's registrar store for `routing::UsrlocContacts`.
 mod-location = { workspace = true, optional = true }
+# Recoverable state records (feature `recovery`); serde_json comes from sip-core.
+serde = { version = "1", features = ["derive"], optional = true }
 
 [features]
 default = ["transport"]
 transport = ["dep:sip-transport"]
 location = ["dep:mod-location"]
+recovery = ["dep:serde"]
 
 [lints]
 workspace = true
@@ -30,6 +33,8 @@ workspace = true
 [dev-dependencies]
 # The example B2BUA's rtpflux client reuses ferrosip's ng bencode codec.
 mod-media.workspace = true
+# recoverable_ua binds with SO_REUSEPORT (two incarnations on one address).
+socket2.workspace = true
 
 [[example]]
 name = "b2bua"
@@ -39,3 +44,15 @@ required-features = ["transport"]
 [[example]]
 name = "bench"
 path = "examples/bench.rs"
+
+[[example]]
+name = "recoverable_ua"
+path = "examples/recoverable_ua.rs"
+required-features = ["recovery"]
+
+[[example]]
+name = "bench_durable"
+required-features = ["recovery"]
+
+[[example]]
+name = "bench_shards"
