@@ -5,7 +5,7 @@ members = ["crates/*", "bin/ferrosip", "tools/*"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.100"
-version = "0.1.0"
+version = "0.2.0"
 license = "GPL-3.0-or-later"
 authors = ["Yehor Smoliakov <egorsmkv@gmail.com>"]
 publish = false
