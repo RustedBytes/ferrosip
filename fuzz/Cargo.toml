@@ -18,6 +18,7 @@ sip-transport = { path = "../crates/sip-transport" }
 sip-diameter = { path = "../crates/sip-diameter" }
 mod-media = { path = "../crates/mod-media" }
 mod-ims = { path = "../crates/mod-ims" }
+sip-ua = { path = "../crates/sip-ua" }
 serde_json = "1"
 
 # Its own workspace: built with nightly by cargo-fuzz, not by `cargo build`.
@@ -79,6 +80,13 @@ bench = false
 [[bin]]
 name = "pv"
 path = "fuzz_targets/pv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sip_ua"
+path = "fuzz_targets/sip_ua.rs"
 test = false
 doc = false
 bench = false

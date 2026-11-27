@@ -1,0 +1,8 @@
+CANCEL sip:ua@127.0.0.1 SIP/2.0
+Via: SIP/2.0/UDP 127.0.0.2:5060;branch=z9hG4bKf1;rport
+From: <sip:a@x>;tag=ft
+To: <sip:ua@x>
+Call-ID: fz
+CSeq: 1 CANCEL
+Content-Length: 0
+

@@ -1,0 +1,14 @@
+INVITE sip:bob@example.com;transport=tcp SIP/2.0
+Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK1;rport
+Via: SIP/2.0/TCP h:1,SIP/2.0/UDP [::1]:5070;received=1.2.3.4
+Max-Forwards: 70
+From: "A" <sip:a@x>;tag=1
+To: <sip:bob@example.com>
+Call-ID: c1
+CSeq: 1 INVITE
+Contact: <sip:a@1.2.3.4:5060;ob>;expires=60;q=0.5;+sip.instance="<urn:uuid:1>";reg-id=1, *
+Route: <sip:p1;lr>,<sip:p2;lr>
+Content-Type: application/sdp
+Content-Length: 4
+
+v=0

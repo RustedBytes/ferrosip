@@ -97,6 +97,7 @@ jobs:
               - crates/sip-diameter/**
               - crates/mod-media/**
               - crates/mod-ims/**
+              - crates/sip-ua/**
               - Cargo.lock
 
   shellcheck:
@@ -266,6 +267,8 @@ jobs:
           sudo systemctl stop postgresql mariadb redis-server 2>/dev/null || true
       - run: etc/tls/gen-certs.sh
       - run: cargo build --release --workspace --features ferrosip/db-all
+      # The sip-ua example B2BUA (tests/e2e_sip_ua.py).
+      - run: cargo build --release -p sip-ua --example b2bua
       # rtpflux, pinned to a commit: move the pin to take a newer version.
       - name: Check out rtpflux (the media relay e2e_rtpflux runs behind the rtpengine module)
         uses: actions/checkout@v7

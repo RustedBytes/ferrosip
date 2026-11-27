@@ -1,0 +1,9 @@
+REGISTER sips:[2001:db8::1]:5061 SIP/2.0
+Via: SIP/2.0/WSS abc.invalid;branch=z9hG4bKw
+From: <sip:u@d>;tag=t
+To: <sip:u@d>
+Call-ID: r
+CSeq: 2 REGISTER
+Authorization: Digest username="u", realm="d", nonce="n", uri="sip:d", response="00", qop=auth, nc=00000001, cnonce="c"
+Content-Length: 0
+
